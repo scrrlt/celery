@@ -47,6 +47,13 @@ class WorkerPoolMetrics:
     worker_cpu_percent: deque[float] = field(default_factory=lambda: deque(maxlen=100))
     active_workers: deque[int] = field(default_factory=lambda: deque(maxlen=100))
     
+    # O(1) running sums for performance (avoids sum() under lock)
+    _queue_depths_sum: int = 0
+    _processing_latencies_sum: float = 0.0
+    _execution_times_sum: float = 0.0
+    _memory_usage_sum: float = 0.0
+    _cpu_percent_sum: float = 0.0
+    
     # Thread safety for deque read operations
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     
@@ -73,8 +80,22 @@ class WorkerPoolMetrics:
     
     def record_job_queue_depth(self, depth: int) -> None:
         """Record current job queue depth for capacity monitoring."""
-        with self._lock:
+        # Use non-blocking lock for async pools (gevent/eventlet)
+        if not self._try_lock():
+            # Drop metric sample rather than block event loop
+            self.collection_errors += 1
+            return
+        
+        try:
+            # Handle maxlen overflow with running sum
+            if len(self.job_queue_depths) >= self.job_queue_depths.maxlen:
+                ejected = self.job_queue_depths[0]  # Will be ejected
+                self._queue_depths_sum -= ejected
+            
             self.job_queue_depths.append(depth)
+            self._queue_depths_sum += depth
+        finally:
+            self._lock.release()
         
         # Automated alerting for queue backpressure
         if depth > self.alert_queue_depth_threshold:
@@ -83,8 +104,22 @@ class WorkerPoolMetrics:
     def record_job_processing_latency(self, start_time: float) -> None:
         """Record job processing latency from start to completion."""
         latency = time.perf_counter() - start_time
-        with self._lock:
+        
+        # Use non-blocking lock for async pools
+        if not self._try_lock():
+            self.collection_errors += 1
+            return
+        
+        try:
+            # Handle maxlen overflow with running sum
+            if len(self.processing_latencies) >= self.processing_latencies.maxlen:
+                ejected = self.processing_latencies[0]  # Will be ejected
+                self._processing_latencies_sum -= ejected
+            
             self.processing_latencies.append(latency)
+            self._processing_latencies_sum += latency
+        finally:
+            self._lock.release()
         
         # Alert on excessive latency indicating performance degradation
         latency_ms = latency * 1000
@@ -93,14 +128,42 @@ class WorkerPoolMetrics:
     
     def record_job_execution_time(self, execution_time: float) -> None:
         """Record actual job execution time (excluding queue wait)."""
-        with self._lock:
+        if not self._try_lock():
+            self.collection_errors += 1
+            return
+        
+        try:
+            # Handle maxlen overflow with running sum
+            if len(self.execution_times) >= self.execution_times.maxlen:
+                ejected = self.execution_times[0]  # Will be ejected
+                self._execution_times_sum -= ejected
+            
             self.execution_times.append(execution_time)
+            self._execution_times_sum += execution_time
+        finally:
+            self._lock.release()
     
     def record_worker_resource_usage(self, memory_mb: float, cpu_percent: float) -> None:
         """Record worker process resource utilization."""
-        with self._lock:
+        if not self._try_lock():
+            self.collection_errors += 1
+            return
+        
+        try:
+            # Handle maxlen overflow with running sums
+            if len(self.worker_memory_usage) >= self.worker_memory_usage.maxlen:
+                ejected_mem = self.worker_memory_usage[0]
+                self._memory_usage_sum -= ejected_mem
+            if len(self.worker_cpu_percent) >= self.worker_cpu_percent.maxlen:
+                ejected_cpu = self.worker_cpu_percent[0] 
+                self._cpu_percent_sum -= ejected_cpu
+            
             self.worker_memory_usage.append(memory_mb)
             self.worker_cpu_percent.append(cpu_percent)
+            self._memory_usage_sum += memory_mb
+            self._cpu_percent_sum += cpu_percent
+        finally:
+            self._lock.release()
         
         if memory_mb > self.alert_memory_threshold_mb:
             self.memory_pressure_events += 1
@@ -108,8 +171,14 @@ class WorkerPoolMetrics:
     
     def record_active_worker_count(self, count: int) -> None:
         """Record number of currently active worker processes."""
-        with self._lock:
+        if not self._try_lock():
+            self.collection_errors += 1
+            return
+        
+        try:
             self.active_workers.append(count)
+        finally:
+            self._lock.release()
     
     def record_job_completion(self, success: bool, retried: bool = False) -> None:
         """Record job completion outcome for reliability metrics."""
@@ -142,59 +211,91 @@ class WorkerPoolMetrics:
     @property 
     def avg_queue_depth(self) -> float:
         """Average job queue depth over recent sampling window."""
-        with self._lock:
-            return sum(self.job_queue_depths) / len(self.job_queue_depths) if self.job_queue_depths else 0.0
+        if not self._try_lock():
+            return 0.0  # Safe fallback for async pools
+        try:
+            return (self._queue_depths_sum / len(self.job_queue_depths)) if self.job_queue_depths else 0.0
+        finally:
+            self._lock.release()
     
     @property
     def max_queue_depth(self) -> int:
         """Maximum queue depth in recent sampling window."""
-        with self._lock:
+        if not self._try_lock():
+            return 0  # Safe fallback for async pools
+        try:
             return max(self.job_queue_depths) if self.job_queue_depths else 0
+        finally:
+            self._lock.release()
     
     @property
     def avg_processing_latency_ms(self) -> float:
         """Average processing latency in milliseconds."""
-        with self._lock:
-            latencies = self.processing_latencies
-            return (sum(latencies) / len(latencies) * 1000) if latencies else 0.0
+        if not self._try_lock():
+            return 0.0  # Safe fallback for async pools
+        try:
+            count = len(self.processing_latencies)
+            return (self._processing_latencies_sum / count * 1000) if count > 0 else 0.0
+        finally:
+            self._lock.release()
     
     @property
     def p95_processing_latency_ms(self) -> float:
         """95th percentile processing latency in milliseconds."""
-        with self._lock:
+        if not self._try_lock():
+            return 0.0  # Safe fallback for async pools
+        try:
             if not self.processing_latencies:
                 return 0.0
             
             sorted_latencies = sorted(self.processing_latencies)
             idx = int(len(sorted_latencies) * 0.95)
             return sorted_latencies[idx] * 1000 if idx < len(sorted_latencies) else 0.0
+        finally:
+            self._lock.release()
     
     @property
     def avg_execution_time_ms(self) -> float:
         """Average job execution time in milliseconds."""
-        with self._lock:
-            times = self.execution_times
-            return (sum(times) / len(times) * 1000) if times else 0.0
+        if not self._try_lock():
+            return 0.0  # Safe fallback for async pools
+        try:
+            count = len(self.execution_times)
+            return (self._execution_times_sum / count * 1000) if count > 0 else 0.0
+        finally:
+            self._lock.release()
     
     @property
     def avg_worker_memory_mb(self) -> float:
         """Average worker memory usage in MB."""
-        with self._lock:
-            usage = self.worker_memory_usage
-            return sum(usage) / len(usage) if usage else 0.0
+        if not self._try_lock():
+            return 0.0  # Safe fallback for async pools
+        try:
+            count = len(self.worker_memory_usage)
+            return (self._memory_usage_sum / count) if count > 0 else 0.0
+        finally:
+            self._lock.release()
     
     @property
     def avg_worker_cpu_percent(self) -> float:
         """Average worker CPU utilization percentage."""
-        with self._lock:
-            cpu = self.worker_cpu_percent
-            return sum(cpu) / len(cpu) if cpu else 0.0
+        if not self._try_lock():
+            return 0.0  # Safe fallback for async pools
+        try:
+            count = len(self.worker_cpu_percent)
+            return (self._cpu_percent_sum / count) if count > 0 else 0.0
+        finally:
+            self._lock.release()
     
     @property
     def current_active_workers(self) -> int:
         """Current number of active workers."""
-        with self._lock:
+        if not self._try_lock():
+            return 1  # Safe fallback for async pools
+        try:
             return self.active_workers[-1] if self.active_workers else 0
+        finally:
+            self._lock.release()
     
     @property
     def success_rate_percent(self) -> float:
@@ -326,6 +427,47 @@ class WorkerPoolMetrics:
         self.worker_spawn_failures = 0
         self.memory_pressure_events = 0
         self.collection_errors = 0
+        
+        # Reset running sums (recalculate for safety)
+        with self._lock:
+            self._recalculate_running_sums()
+    
+    def _recalculate_running_sums(self) -> None:
+        """Recalculate running sums for safety (called under lock)."""
+        self._queue_depths_sum = sum(self.job_queue_depths)
+        self._processing_latencies_sum = sum(self.processing_latencies)
+        self._execution_times_sum = sum(self.execution_times)
+        self._memory_usage_sum = sum(self.worker_memory_usage) 
+        self._cpu_percent_sum = sum(self.worker_cpu_percent)
+    
+    def _try_lock(self, timeout: float = 0.001) -> bool:
+        """Try to acquire lock without blocking async event loops.
+        
+        For gevent/eventlet pools, this prevents freezing the entire event loop
+        when telemetry contention occurs. Gracefully drops metrics rather than blocking.
+        
+        Args:
+            timeout: Maximum time to wait for lock (seconds)
+            
+        Returns:
+            True if lock acquired, False if timeout or would block
+        """
+        try:
+            # Try non-blocking acquisition first
+            if self._lock.acquire(blocking=False):
+                return True
+            
+            # For short timeout, try once more with minimal blocking
+            if timeout > 0:
+                return self._lock.acquire(blocking=True, timeout=timeout)
+            
+            return False
+        except Exception:
+            # Fallback for locks that don't support timeout
+            try:
+                return self._lock.acquire(blocking=False)
+            except Exception:
+                return False
 
 
 class TelemetryCollector:

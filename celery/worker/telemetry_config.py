@@ -16,6 +16,8 @@ Usage in celeryconfig.py:
             'enabled': True,                    # Explicit opt-in
             'collection_interval_s': 30.0,     # Resource collection frequency
             'health_log_interval_s': 300.0,    # Health summary logging frequency
+            'prefer_otel': True,               # Use OpenTelemetry if available
+            'otel_meter_name': 'myapp.celery', # Custom OTel meter namespace
         },
         
         # Optional: Register telemetry Bootstep explicitly
@@ -40,6 +42,25 @@ Alternative configuration via environment variables:
     export CELERY_WORKER_TELEMETRY_ENABLED=true
     export CELERY_WORKER_TELEMETRY_COLLECTION_INTERVAL_S=30.0
     export CELERY_WORKER_TELEMETRY_HEALTH_LOG_INTERVAL_S=300.0
+    export CELERY_WORKER_TELEMETRY_PREFER_OTEL=true
+
+OpenTelemetry Integration:
+
+    # If opentelemetry-api is installed, metrics will automatically
+    # be exported to OTel instead of using internal deque collection.
+    # This provides better performance and industry-standard observability.
+    
+    # Install OTel for enhanced telemetry:
+    # pip install opentelemetry-api opentelemetry-sdk
+    
+    # Configure OTel exporters (example for Prometheus):
+    from opentelemetry import metrics
+    from opentelemetry.exporter.prometheus import PrometheusMetricReader
+    from opentelemetry.sdk.metrics import MeterProvider
+    
+    metrics.set_meter_provider(
+        MeterProvider(metric_readers=[PrometheusMetricReader()])
+    )
 
 Note: Telemetry is OPT-IN by default and requires explicit configuration
 to avoid breaking existing production deployments.
@@ -50,6 +71,8 @@ DEFAULT_WORKER_TELEMETRY = {
     'enabled': False,                # OPT-IN: Must be explicitly enabled
     'collection_interval_s': 60.0,   # Resource monitoring frequency  
     'health_log_interval_s': 300.0,  # Health summary logging frequency
+    'prefer_otel': True,             # Prefer OpenTelemetry if available
+    'otel_meter_name': 'celery.worker.telemetry',  # OTel meter namespace
 }
 
 # Recommended production configuration
@@ -57,6 +80,8 @@ PRODUCTION_WORKER_TELEMETRY = {
     'enabled': True,
     'collection_interval_s': 30.0,   # More frequent collection for production
     'health_log_interval_s': 180.0,  # Frequent health summaries for monitoring
+    'prefer_otel': True,             # Use OTel for better performance
+    'otel_meter_name': 'myapp.celery.worker',  # Application-specific namespace
 }
 
 # Development configuration
@@ -64,4 +89,16 @@ DEVELOPMENT_WORKER_TELEMETRY = {
     'enabled': True,
     'collection_interval_s': 10.0,   # Frequent collection for development
     'health_log_interval_s': 60.0,   # Frequent logging for debugging
+    'prefer_otel': False,            # Use internal collection for simplicity
+    'otel_meter_name': 'dev.celery.worker',
+}
+
+# High-performance configuration (OpenTelemetry required)
+HIGH_PERFORMANCE_TELEMETRY = {
+    'enabled': True,
+    'collection_interval_s': 5.0,    # Very frequent for high-throughput systems
+    'health_log_interval_s': 60.0,   # Frequent health monitoring
+    'prefer_otel': True,             # Required for high-performance
+    'otel_meter_name': 'highperf.celery.worker',
+    'force_otel': True,              # Fail if OTel not available
 }

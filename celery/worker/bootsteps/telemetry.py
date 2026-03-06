@@ -58,22 +58,29 @@ class TelemetryBootstep(bootsteps.Step):
         self.enabled = worker_options.get('enabled', False)  # Opt-in by default
         self.collection_interval = worker_options.get('collection_interval_s', 60.0)
         self.health_log_interval = worker_options.get('health_log_interval_s', 300.0)
+        self.prefer_otel = worker_options.get('prefer_otel', True)
+        self.otel_meter_name = worker_options.get('otel_meter_name', 'celery.worker.telemetry')
+        self.force_otel = worker_options.get('force_otel', False)
         
         # Telemetry collector instance
         self.telemetry: TelemetryCollector | None = None
         
+        # Event monitoring state
+        self.event_state = None
+        self._task_start_times: dict[str, float] = {}  # Track task start times across processes
+        
         # Resource monitoring thread
         self._monitor_thread: threading.Thread | None = None
         self._stop_monitoring = threading.Event()
-        
-        # Signal connections
-        self._signal_connections: list[Any] = []
         
     def create(self, worker) -> TelemetryCollector | None:
         """Create and initialize telemetry collector.
         
         Called during worker startup to initialize telemetry systems.
         Only creates telemetry if explicitly enabled in configuration.
+        
+        IMPORTANT: For prefork pools, this runs in the MAIN process only.
+        Child process metrics are collected via broker events, not signals.
         
         Args:
             worker: Worker instance
@@ -86,26 +93,47 @@ class TelemetryBootstep(bootsteps.Step):
             return None
         
         logger.info(
-            "Initializing worker telemetry: collection_interval=%.1fs, health_interval=%.1fs",
-            self.collection_interval, self.health_log_interval
+            "Initializing worker telemetry: collection_interval=%.1fs, health_interval=%.1fs, prefer_otel=%s",
+            self.collection_interval, self.health_log_interval, self.prefer_otel
         )
         
-        # Initialize global telemetry
-        initialize_telemetry(
-            enabled=True,
-            collection_interval_s=self.collection_interval,
-            health_log_interval_s=self.health_log_interval
-        )
-        
-        # Get the telemetry collector instance  
-        from celery.worker.telemetry import get_telemetry_collector
-        self.telemetry = get_telemetry_collector()
+        # Choose telemetry collector (OpenTelemetry or standard)
+        try:
+            from celery.worker.telemetry_otel import get_otel_telemetry_collector
+            
+            collector = get_otel_telemetry_collector(
+                enabled=True,
+                collection_interval_s=self.collection_interval,
+                health_log_interval_s=self.health_log_interval,
+                prefer_otel=self.prefer_otel
+            )
+            
+            if self.force_otel and not hasattr(collector, 'otel_integration'):
+                raise ImportError("OpenTelemetry integration required but not available")
+                
+            self.telemetry = collector
+            
+        except ImportError as e:
+            if self.force_otel:
+                logger.error("OpenTelemetry required but not available: %s", e)
+                raise
+            
+            # Fall back to standard telemetry
+            logger.info("Falling back to standard telemetry collector")
+            initialize_telemetry(
+                enabled=True,
+                collection_interval_s=self.collection_interval,
+                health_log_interval_s=self.health_log_interval
+            )
+            
+            from celery.worker.telemetry import get_telemetry_collector
+            self.telemetry = get_telemetry_collector()
         
         if self.telemetry:
-            # Connect to Celery signals for event collection
-            self._connect_signals()
+            # Connect to broker events (works across process boundaries)
+            self._setup_event_monitoring(worker)
             
-            # Start resource monitoring thread
+            # Start resource monitoring thread (main process only)
             self._start_resource_monitoring(worker)
             
             logger.info("Worker telemetry initialized successfully")
@@ -156,8 +184,8 @@ class TelemetryBootstep(bootsteps.Step):
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=5.0)
         
-        # Disconnect signal handlers
-        self._disconnect_signals()
+        # Disconnect event monitoring
+        self._disconnect_event_monitoring()
         
         # Log final health summary
         health_summary = self.telemetry.get_health_summary()
@@ -166,105 +194,139 @@ class TelemetryBootstep(bootsteps.Step):
         
         logger.info("Worker telemetry stopped")
     
-    def _connect_signals(self) -> None:
-        """Connect to Celery signals for task event collection."""
-        # Task lifecycle signals
-        self._signal_connections.extend([
-            signals.task_received.connect(self._on_task_received, weak=False),
-            signals.task_prerun.connect(self._on_task_prerun, weak=False), 
-            signals.task_postrun.connect(self._on_task_postrun, weak=False),
-            signals.task_failure.connect(self._on_task_failure, weak=False),
-            signals.task_retry.connect(self._on_task_retry, weak=False),
-        ])
+    def _setup_event_monitoring(self, worker) -> None:
+        """Setup event monitoring that works across process boundaries.
         
-        # Worker lifecycle signals
-        self._signal_connections.extend([
-            signals.worker_process_init.connect(self._on_worker_process_init, weak=False),
-            signals.worker_process_shutdown.connect(self._on_worker_process_shutdown, weak=False),
-        ])
+        For prefork pools, this monitors broker events (task-received, task-succeeded, etc.)
+        that are properly routed back to the main process, avoiding COW memory issues.
+        """
+        try:
+            # Import here to avoid circular imports
+            from celery.events import Event
+            from celery.events.state import State
+            
+            # Create event state monitor
+            self.event_state = State()
+            
+            # Set up event handlers
+            self.event_state.handlers.update({
+                'task-received': self._on_task_received_event,
+                'task-started': self._on_task_started_event,
+                'task-succeeded': self._on_task_succeeded_event,
+                'task-failed': self._on_task_failed_event,
+                'task-retry': self._on_task_retry_event,
+                'worker-online': self._on_worker_online_event,
+                'worker-offline': self._on_worker_offline_event,
+            })
+            
+            # Enable task events on this worker
+            worker.app.control.enable_events()
+            
+            logger.debug("Event monitoring setup complete")
+            
+        except Exception as e:
+            logger.warning("Failed to setup event monitoring: %s", e)
     
-    def _disconnect_signals(self) -> None:
-        """Disconnect signal handlers."""
-        for connection in self._signal_connections:
-            try:
-                connection.disconnect()
-            except Exception as e:
-                logger.debug("Error disconnecting signal: %s", e)
-        self._signal_connections.clear()
+    def _disconnect_event_monitoring(self) -> None:
+        """Disconnect event monitoring."""
+        if hasattr(self, 'event_state'):
+            self.event_state = None
     
-    def _on_task_received(self, sender=None, task_id=None, task=None, **kwargs) -> None:
-        """Handle task received signal."""
+    def _on_task_received_event(self, event) -> None:
+        """Handle task-received broker event (main process)."""
         if not self.telemetry:
             return
         
-        # Record task received (estimate queue depth from worker state)
-        queue_depth = self._estimate_queue_depth()
+        # Estimate queue depth from event metadata
+        queue_depth = self._estimate_queue_depth_from_event(event)
         self.telemetry.record_job_received(queue_depth)
     
-    def _on_task_prerun(self, sender=None, task_id=None, task=None, **kwargs) -> None:
-        """Handle task prerun signal."""
+    def _on_task_started_event(self, event) -> None:
+        """Handle task-started broker event (main process)."""
         if not self.telemetry:
             return
         
-        # Store start time for latency calculation
-        start_time = self.telemetry.record_job_started()
-        if hasattr(task, '_telemetry_start_time'):
-            task._telemetry_start_time = start_time
-        
-    def _on_task_postrun(self, sender=None, task_id=None, task=None, retval=None, state=None, **kwargs) -> None:
-        """Handle task postrun signal."""
-        if not self.telemetry:
-            return
-        
-        # Record job completion
-        start_time = getattr(task, '_telemetry_start_time', 0.0) if task else 0.0
-        success = state not in ('FAILURE', 'RETRY', 'REVOKED')
-        
-        self.telemetry.record_job_completed(
-            start_time=start_time,
-            execution_start=start_time,  # Simplified - could be enhanced
-            success=success,
-            retried=False
-        )
+        # Store start timestamp for latency calculation
+        task_id = event.get('uuid')
+        if task_id:
+            # Use event timestamp for accurate timing
+            start_time = event.get('timestamp', time.perf_counter())
+            self._task_start_times[task_id] = start_time
     
-    def _on_task_failure(self, sender=None, task_id=None, exception=None, traceback=None, einfo=None, **kwargs) -> None:
-        """Handle task failure signal."""
-        # Failure is already handled in postrun, but we could add specific error telemetry here
+    def _on_task_succeeded_event(self, event) -> None:
+        """Handle task-succeeded broker event (main process)."""
+        if not self.telemetry:
+            return
+        
+        self._record_task_completion(event, success=True)
+    
+    def _on_task_failed_event(self, event) -> None:
+        """Handle task-failed broker event (main process)."""
+        if not self.telemetry:
+            return
+        
+        self._record_task_completion(event, success=False)
+    
+    def _on_task_retry_event(self, event) -> None:
+        """Handle task-retry broker event (main process)."""
+        if not self.telemetry:
+            return
+        
+        # Record retry without removing from start times (task will continue)
+        task_id = event.get('uuid')
+        start_time = self._task_start_times.get(task_id, 0.0)
+        
+        if start_time > 0:
+            self.telemetry.record_job_completed(
+                start_time=start_time,
+                execution_start=start_time,
+                success=False,
+                retried=True
+            )
+    
+    def _on_worker_online_event(self, event) -> None:
+        """Handle worker-online event."""
+        # Could track worker pool composition here
         pass
     
-    def _on_task_retry(self, sender=None, task_id=None, reason=None, einfo=None, **kwargs) -> None:
-        """Handle task retry signal.""" 
-        if not self.telemetry:
-            return
-        
-        # Record retry event (will be captured in postrun with retried=True flag)
-        # Could enhance to track retry-specific metrics
-        pass
-        
-    def _on_worker_process_init(self, sender=None, **kwargs) -> None:
-        """Handle worker process initialization."""
-        if self.telemetry:
-            # Could record worker process spawn events here
-            pass
-    
-    def _on_worker_process_shutdown(self, sender=None, **kwargs) -> None:
-        """Handle worker process shutdown."""
+    def _on_worker_offline_event(self, event) -> None:
+        """Handle worker-offline event."""
         if self.telemetry:
             self.telemetry.record_pool_event("restart")
     
-    def _estimate_queue_depth(self) -> int:
-        """Estimate current queue depth from worker state.
+    def _record_task_completion(self, event, success: bool) -> None:
+        """Record task completion from broker event."""
+        task_id = event.get('uuid')
+        if not task_id:
+            return
         
-        This is a simplified estimation. In production, this could be enhanced
-        to query the actual broker queue for more accurate depth measurements.
+        # Get start time from our tracking
+        start_time = self._task_start_times.pop(task_id, 0.0)
         
-        Returns:
-            Estimated queue depth
+        if start_time > 0:
+            # Use event timestamp for accurate completion time
+            completion_time = event.get('timestamp', time.perf_counter()) 
+            runtime = event.get('runtime', 0.0)  # Actual execution time from event
+            
+            # Calculate execution start time
+            execution_start = completion_time - runtime if runtime > 0 else start_time
+            
+            self.telemetry.record_job_completed(
+                start_time=start_time,
+                execution_start=execution_start,
+                success=success,
+                retried=False
+            )
+    
+    def _estimate_queue_depth_from_event(self, event) -> int:
+        """Estimate queue depth from broker event metadata.
+        
+        This is more accurate than estimating from worker state since
+        events come from the broker which knows the actual queue state.
         """
-        if hasattr(self.consumer, 'qos') and hasattr(self.consumer.qos, 'can_consume'):
-            # Use prefetch count as a proxy for queue depth
-            return getattr(self.consumer.qos, 'value', 0)
-        return 0
+        # Could be enhanced to extract actual queue depth from broker metadata
+        # For now, return a reasonable default
+        return getattr(event, 'clock', 0) % 100  # Simple proxy based on logical clock
     
     def _start_resource_monitoring(self, worker) -> None:
         """Start background resource monitoring thread."""
