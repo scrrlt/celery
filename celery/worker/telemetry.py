@@ -16,10 +16,11 @@ Metrics collected:
 - Pool capacity utilization and backpressure indicators
 """
 
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any
 
 from celery.utils.log import get_logger
 
@@ -37,14 +38,17 @@ class WorkerPoolMetrics:
     """
     
     # Job queue performance tracking (memory bounded)
-    job_queue_depths: deque = field(default_factory=lambda: deque(maxlen=200))
-    processing_latencies: deque = field(default_factory=lambda: deque(maxlen=200))
-    execution_times: deque = field(default_factory=lambda: deque(maxlen=200))
+    job_queue_depths: deque[int] = field(default_factory=lambda: deque(maxlen=200))
+    processing_latencies: deque[float] = field(default_factory=lambda: deque(maxlen=200))
+    execution_times: deque[float] = field(default_factory=lambda: deque(maxlen=200))
     
     # Worker process health indicators
-    worker_memory_usage: deque = field(default_factory=lambda: deque(maxlen=100))
-    worker_cpu_percent: deque = field(default_factory=lambda: deque(maxlen=100))
-    active_workers: deque = field(default_factory=lambda: deque(maxlen=100))
+    worker_memory_usage: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    worker_cpu_percent: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    active_workers: deque[int] = field(default_factory=lambda: deque(maxlen=100))
+    
+    # Thread safety for deque read operations
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     
     # Throughput and reliability counters
     jobs_processed: int = 0
@@ -64,12 +68,13 @@ class WorkerPoolMetrics:
     alert_memory_threshold_mb: float = 512.0
     
     # Telemetry collection metadata
-    last_collection_time: float = field(default_factory=time.time)
+    last_collection_time: float = field(default_factory=time.perf_counter)
     collection_errors: int = 0
     
     def record_job_queue_depth(self, depth: int) -> None:
         """Record current job queue depth for capacity monitoring."""
-        self.job_queue_depths.append(depth)
+        with self._lock:
+            self.job_queue_depths.append(depth)
         
         # Automated alerting for queue backpressure
         if depth > self.alert_queue_depth_threshold:
@@ -77,8 +82,9 @@ class WorkerPoolMetrics:
     
     def record_job_processing_latency(self, start_time: float) -> None:
         """Record job processing latency from start to completion."""
-        latency = time.time() - start_time
-        self.processing_latencies.append(latency)
+        latency = time.perf_counter() - start_time
+        with self._lock:
+            self.processing_latencies.append(latency)
         
         # Alert on excessive latency indicating performance degradation
         latency_ms = latency * 1000
@@ -87,12 +93,14 @@ class WorkerPoolMetrics:
     
     def record_job_execution_time(self, execution_time: float) -> None:
         """Record actual job execution time (excluding queue wait)."""
-        self.execution_times.append(execution_time)
+        with self._lock:
+            self.execution_times.append(execution_time)
     
     def record_worker_resource_usage(self, memory_mb: float, cpu_percent: float) -> None:
         """Record worker process resource utilization."""
-        self.worker_memory_usage.append(memory_mb)
-        self.worker_cpu_percent.append(cpu_percent)
+        with self._lock:
+            self.worker_memory_usage.append(memory_mb)
+            self.worker_cpu_percent.append(cpu_percent)
         
         if memory_mb > self.alert_memory_threshold_mb:
             self.memory_pressure_events += 1
@@ -100,7 +108,8 @@ class WorkerPoolMetrics:
     
     def record_active_worker_count(self, count: int) -> None:
         """Record number of currently active worker processes."""
-        self.active_workers.append(count)
+        with self._lock:
+            self.active_workers.append(count)
     
     def record_job_completion(self, success: bool, retried: bool = False) -> None:
         """Record job completion outcome for reliability metrics."""
@@ -133,51 +142,59 @@ class WorkerPoolMetrics:
     @property 
     def avg_queue_depth(self) -> float:
         """Average job queue depth over recent sampling window."""
-        return sum(self.job_queue_depths) / len(self.job_queue_depths) if self.job_queue_depths else 0.0
+        with self._lock:
+            return sum(self.job_queue_depths) / len(self.job_queue_depths) if self.job_queue_depths else 0.0
     
     @property
     def max_queue_depth(self) -> int:
         """Maximum queue depth in recent sampling window."""
-        return max(self.job_queue_depths) if self.job_queue_depths else 0
+        with self._lock:
+            return max(self.job_queue_depths) if self.job_queue_depths else 0
     
     @property
     def avg_processing_latency_ms(self) -> float:
         """Average processing latency in milliseconds."""
-        latencies = self.processing_latencies
-        return (sum(latencies) / len(latencies) * 1000) if latencies else 0.0
+        with self._lock:
+            latencies = self.processing_latencies
+            return (sum(latencies) / len(latencies) * 1000) if latencies else 0.0
     
     @property
     def p95_processing_latency_ms(self) -> float:
         """95th percentile processing latency in milliseconds."""
-        if not self.processing_latencies:
-            return 0.0
-        
-        sorted_latencies = sorted(self.processing_latencies)
-        idx = int(len(sorted_latencies) * 0.95)
-        return sorted_latencies[idx] * 1000 if idx < len(sorted_latencies) else 0.0
+        with self._lock:
+            if not self.processing_latencies:
+                return 0.0
+            
+            sorted_latencies = sorted(self.processing_latencies)
+            idx = int(len(sorted_latencies) * 0.95)
+            return sorted_latencies[idx] * 1000 if idx < len(sorted_latencies) else 0.0
     
     @property
     def avg_execution_time_ms(self) -> float:
         """Average job execution time in milliseconds."""
-        times = self.execution_times
-        return (sum(times) / len(times) * 1000) if times else 0.0
+        with self._lock:
+            times = self.execution_times
+            return (sum(times) / len(times) * 1000) if times else 0.0
     
     @property
     def avg_worker_memory_mb(self) -> float:
         """Average worker memory usage in MB."""
-        usage = self.worker_memory_usage
-        return sum(usage) / len(usage) if usage else 0.0
+        with self._lock:
+            usage = self.worker_memory_usage
+            return sum(usage) / len(usage) if usage else 0.0
     
     @property
     def avg_worker_cpu_percent(self) -> float:
         """Average worker CPU utilization percentage."""
-        cpu = self.worker_cpu_percent
-        return sum(cpu) / len(cpu) if cpu else 0.0
+        with self._lock:
+            cpu = self.worker_cpu_percent
+            return sum(cpu) / len(cpu) if cpu else 0.0
     
     @property
     def current_active_workers(self) -> int:
         """Current number of active workers."""
-        return self.active_workers[-1] if self.active_workers else 0
+        with self._lock:
+            return self.active_workers[-1] if self.active_workers else 0
     
     @property
     def success_rate_percent(self) -> float:
@@ -191,7 +208,7 @@ class WorkerPoolMetrics:
         total = self.jobs_processed + self.jobs_failed
         return (self.jobs_retried / total * 100) if total > 0 else 0.0
     
-    def get_comprehensive_health_summary(self) -> Dict:
+    def get_comprehensive_health_summary(self) -> dict[str, Any]:
         """Generate comprehensive health metrics for external monitoring systems.
         
         Returns structured telemetry suitable for Prometheus, DataDog, or other
@@ -199,7 +216,7 @@ class WorkerPoolMetrics:
         and reliability indicators.
         """
         return {
-            "timestamp": time.time(),
+            "timestamp": time.perf_counter(),
             "queue_performance": {
                 "avg_depth": self.avg_queue_depth,
                 "max_depth": self.max_queue_depth,
@@ -231,11 +248,11 @@ class WorkerPoolMetrics:
             },
             "telemetry_health": {
                 "collection_errors": self.collection_errors,
-                "last_collection_age_s": time.time() - self.last_collection_time,
+                "last_collection_age_s": time.perf_counter() - self.last_collection_time,
             }
         }
     
-    def get_alert_conditions(self) -> List[Dict]:
+    def get_alert_conditions(self) -> list[dict[str, Any]]:
         """Check for alert conditions requiring operator attention."""
         alerts = []
         
@@ -320,14 +337,14 @@ class TelemetryCollector:
     
     def __init__(
         self, 
-        enabled: bool = True,
+        enabled: bool = False,  # Opt-in by default
         collection_interval_s: float = 60.0,
         health_log_interval_s: float = 300.0
     ):
         """Initialize telemetry collector.
         
         Args:
-            enabled: Enable telemetry collection (default: True)
+            enabled: Enable telemetry collection (default: False - opt-in)
             collection_interval_s: Resource collection interval in seconds
             health_log_interval_s: Health summary logging interval in seconds
         """
@@ -336,8 +353,8 @@ class TelemetryCollector:
         self.health_log_interval_s = health_log_interval_s
         
         self.metrics = WorkerPoolMetrics() if enabled else None
-        self._last_health_log = time.time()
-        self._last_resource_collection = time.time()
+        self._last_health_log = time.perf_counter()
+        self._last_resource_collection = time.perf_counter()
     
     def record_job_received(self, queue_depth: int) -> None:
         """Record job received event with current queue depth."""
@@ -352,7 +369,7 @@ class TelemetryCollector:
     
     def record_job_started(self) -> float:
         """Record job start and return timestamp for latency calculation."""
-        return time.time() if self.enabled else 0.0
+        return time.perf_counter() if self.enabled else 0.0
     
     def record_job_completed(
         self, 
@@ -371,7 +388,7 @@ class TelemetryCollector:
             
             # Calculate and record execution time (excluding queue wait)
             if execution_start > 0:
-                execution_time = time.time() - execution_start
+                execution_time = time.perf_counter() - execution_start
                 self.metrics.record_job_execution_time(execution_time)
             
             # Record completion outcome
@@ -392,7 +409,7 @@ class TelemetryCollector:
         try:
             self.metrics.record_worker_resource_usage(memory_mb, cpu_percent)
             self.metrics.record_active_worker_count(active_workers)
-            self._last_resource_collection = time.time()
+            self._last_resource_collection = time.perf_counter()
         except Exception as e:
             self.metrics.collection_errors += 1
             logger.debug("Resource telemetry error: %s", e)
@@ -413,14 +430,14 @@ class TelemetryCollector:
             self.metrics.collection_errors += 1
             logger.debug("Pool event telemetry error: %s", e)
     
-    def get_health_summary(self) -> Optional[Dict]:
+    def get_health_summary(self) -> dict[str, Any] | None:
         """Get current health summary for external monitoring."""
         if not self.enabled or not self.metrics:
             return None
         
         return self.metrics.get_comprehensive_health_summary()
     
-    def check_alerts(self) -> List[Dict]:
+    def check_alerts(self) -> list[dict[str, Any]]:
         """Check for active alert conditions."""
         if not self.enabled or not self.metrics:
             return []
@@ -429,7 +446,7 @@ class TelemetryCollector:
     
     def _periodic_health_logging(self) -> None:
         """Log health summary at configured intervals."""
-        now = time.time()
+        now = time.perf_counter()
         if now - self._last_health_log >= self.health_log_interval_s:
             self._log_health_summary()
             self._last_health_log = now
@@ -471,23 +488,23 @@ class TelemetryCollector:
 
 
 # Global telemetry collector instance
-_telemetry_collector: Optional[TelemetryCollector] = None
+_telemetry_collector: TelemetryCollector | None = None
 
 
-def get_telemetry_collector() -> Optional[TelemetryCollector]:
+def get_telemetry_collector() -> TelemetryCollector | None:
     """Get the global telemetry collector instance."""
     return _telemetry_collector
 
 
 def initialize_telemetry(
-    enabled: bool = True,
+    enabled: bool = False,  # Opt-in by default
     collection_interval_s: float = 60.0, 
     health_log_interval_s: float = 300.0
 ) -> None:
     """Initialize global telemetry collection.
     
     Args:
-        enabled: Enable telemetry collection
+        enabled: Enable telemetry collection (default: False - opt-in)
         collection_interval_s: Resource collection interval
         health_log_interval_s: Health summary logging interval
     """

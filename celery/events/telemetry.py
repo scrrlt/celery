@@ -15,10 +15,10 @@ Extends the existing EventDispatcher to include bidirectional telemetry:
 - Inbound: Collects internal metrics for health analysis (new functionality)
 """
 
-import time
 import threading
+import time
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any
 
 from kombu.utils.functional import retry_over_time
 
@@ -38,20 +38,20 @@ class EventTelemetryCollector:
     to prevent memory leaks during high-volume event processing.
     """
     
-    def __init__(self, enabled: bool = True, window_size: int = 1000):
+    def __init__(self, enabled: bool = False, window_size: int = 1000):  # Opt-in
         """Initialize event telemetry collector.
         
         Args:
-            enabled: Enable telemetry collection
+            enabled: Enable telemetry collection (default: False - opt-in)
             window_size: Size of rolling window for event analysis
         """
         self.enabled = enabled
         self.window_size = window_size
         
         # Event frequency tracking (minimal memory footprint)
-        self.event_counts: Dict[str, int] = defaultdict(int)
-        self.event_timestamps: deque = deque(maxlen=window_size)
-        self.event_types: deque = deque(maxlen=window_size)
+        self.event_counts: dict[str, int] = defaultdict(int)
+        self.event_timestamps: deque[float] = deque(maxlen=window_size)
+        self.event_types: deque[str] = deque(maxlen=window_size)
         
         # Error and health tracking
         self.dispatch_errors: int = 0
@@ -59,7 +59,7 @@ class EventTelemetryCollector:
         self.buffer_overflows: int = 0
         
         # Performance metrics
-        self.dispatch_latencies: deque = deque(maxlen=200)  # Last 200 dispatches
+        self.dispatch_latencies: deque[float] = deque(maxlen=200)  # Last 200 dispatches
         self.total_events_dispatched: int = 0
         
         # Health thresholds for alerting
@@ -70,7 +70,7 @@ class EventTelemetryCollector:
         self._lock = threading.RLock()
         
         # Last health check
-        self._last_health_check = time.time()
+        self._last_health_check = time.perf_counter()
         self._health_check_interval = 300.0  # 5 minutes
     
     def record_event_dispatched(self, event_type: str, dispatch_time: float = 0.0) -> None:
@@ -90,7 +90,7 @@ class EventTelemetryCollector:
                 self.total_events_dispatched += 1
                 
                 # Record timing data
-                current_time = time.time()
+                current_time = time.perf_counter()
                 self.event_timestamps.append(current_time)
                 self.event_types.append(event_type)
                 
@@ -124,7 +124,7 @@ class EventTelemetryCollector:
             else:
                 self.dispatch_errors += 1
     
-    def get_event_frequency_analysis(self, window_seconds: int = 300) -> Dict[str, Any]:
+    def get_event_frequency_analysis(self, window_seconds: int = 300) -> dict[str, Any]:
         """Analyze event frequency patterns over time window.
         
         Args:
@@ -137,7 +137,7 @@ class EventTelemetryCollector:
             return {}
         
         with self._lock:
-            current_time = time.time()
+            current_time = time.perf_counter()
             cutoff_time = current_time - window_seconds
             
             # Filter events within window
@@ -165,7 +165,7 @@ class EventTelemetryCollector:
                 "analysis_timestamp": current_time
             }
     
-    def get_health_summary(self) -> Dict[str, Any]:
+    def get_health_summary(self) -> dict[str, Any]:
         """Get comprehensive event system health summary."""
         if not self.enabled:
             return {"enabled": False}
@@ -232,7 +232,7 @@ class EventTelemetryCollector:
         else:
             return "healthy"
     
-    def _check_alert_conditions(self, error_rate: float, avg_latency_ms: float) -> List[Dict]:
+    def _check_alert_conditions(self, error_rate: float, avg_latency_ms: float) -> list[dict[str, Any]]:
         """Check for conditions requiring alerts."""
         alerts = []
         
@@ -284,7 +284,7 @@ class TelemetryIntegratedEventDispatcher(BaseEventDispatcher):
     def __init__(self, *args, **kwargs):
         """Initialize dispatcher with telemetry collection."""
         # Extract telemetry configuration
-        enable_telemetry = kwargs.pop('enable_telemetry', True)
+        enable_telemetry = kwargs.pop('enable_telemetry', False)  # Opt-in
         telemetry_window_size = kwargs.pop('telemetry_window_size', 1000)
         
         super().__init__(*args, **kwargs)
@@ -307,14 +307,14 @@ class TelemetryIntegratedEventDispatcher(BaseEventDispatcher):
         Extends base send() method to collect internal telemetry about
         event dispatch performance and reliability.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         
         try:
             # Call parent send method
             event = super().send(type_, **fields)
             
             # Record successful dispatch
-            dispatch_time = time.time() - start_time
+            dispatch_time = time.perf_counter() - start_time
             self.telemetry_collector.record_event_dispatched(type_, dispatch_time)
             
             # Integrate with worker pool metrics if available
@@ -343,7 +343,7 @@ class TelemetryIntegratedEventDispatcher(BaseEventDispatcher):
                     self._buffer_overflow_logged = True
             raise
     
-    def _integrate_task_event(self, event_type: str, fields: Dict[str, Any]) -> None:
+    def _integrate_task_event(self, event_type: str, fields: dict[str, Any]) -> None:
         """Integrate task events with worker pool telemetry.
         
         Args:
