@@ -1,4 +1,4 @@
-"""Production-ready telemetry and monitoring integration."""
+"""Telemetry and monitoring integration."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from celery.worker.telemetry import init_telemetry, get_collector
+from celery.app.validation import setup_app_validation
 
 if TYPE_CHECKING:
     from celery.app.base import Celery
@@ -15,50 +16,64 @@ logger = logging.getLogger(__name__)
 def enable_production_telemetry(
     app: Celery,
     telemetry_enabled: bool = True,
+    validation_enabled: bool = True,
 ) -> None:
-
-    """Safely injects production-grade telemetry and health monitoring.
+    """Configures telemetry and health monitoring.
     
-    This function serves as the central orchestration point for non-intrusive 
-    observability enhancements. It is designed to be called during the 
-    application's bootstrapping phase.
+    This function initializes worker metrics and registers monitoring tasks
+    during the application bootstrapping phase.
     
     Args:
-        app: The Celery application instance to enhance.
-        telemetry_enabled: Whether to active worker pool metrics.
+        app: The Celery application instance.
+        telemetry_enabled: Whether to enable worker pool metrics.
+        validation_enabled: Whether to enable runtime configuration checks.
     """
-    logger.info("Injecting production telemetry enhancements")
+    logger.info("Enabling telemetry components")
     
     if telemetry_enabled:
         init_telemetry(enabled=True)
         logger.info("Worker pool telemetry active")
+
+    if validation_enabled:
+        setup_app_validation(app)
+        logger.info("Configuration validation active")
     
-    # Internal tasks are registered to allow for fleet-wide monitoring via 
-    # remote control commands or specialized management tools.
+    # Register internal tasks used for fleet-wide health aggregation.
     _add_health_tasks(app)
 
 def _add_health_tasks(app: Celery) -> None:
-    """Registers built-in health monitoring tasks.
+    """Registers internal health monitoring tasks.
     
-    These tasks enable monitoring tools to query worker health directly 
-    via the message broker, reducing the need for sidecar processes.
+    These tasks enable tools to query worker health via the message broker.
     """
     
-    @app.task(name='celery.health.summary', bind=True)
+    @app.task(name='celery.internal.telemetry.health_summary', bind=True)
     def get_health_summary(self) -> dict[str, Any]:
         """Returns a snapshot of worker performance and queue stats.
         
         Returns:
             A dictionary containing rolling window averages and resource usage.
+            Always returns a consistent dictionary schema.
         """
         collector = get_collector()
-        return collector.get_summary() or {"status": "telemetry_disabled"}
+        summary = collector.get_summary()
+        if summary is None:
+            return {
+                "status": "disabled",
+                "avg_queue_depth": 0.0,
+                "avg_latency_ms": 0.0,
+                "jobs_processed": 0,
+                "jobs_failed": 0,
+                "resource_usage": {"memory_mb": 0.0, "cpu_percent": 0.0}
+            }
+        
+        return {"status": "active", **summary}
 
     @app.task(name='celery.health.ping')
     def ping() -> str:
-        """Lightweight responsiveness check for connectivity verification.
+        """Lightweight responsiveness check.
         
         Returns:
-            The literal string "pong" upon successful execution.
+            The literal string "pong".
         """
         return "pong"

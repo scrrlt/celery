@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from typing import Any, TYPE_CHECKING, Final
 
 from celery.events.dispatcher import EventDispatcher as BaseEventDispatcher
@@ -18,6 +18,8 @@ logger = get_logger(__name__)
 
 # Default capacity for latency tracking to bound memory growth in high-throughput environments
 LATENCY_WINDOW_SIZE: Final[int] = 200
+# Max task names to track to prevent unbounded memory growth
+MAX_TASK_NAMES_TRACKED: Final[int] = 500
 
 class EventTelemetry:
     """Aggregator for internal event stream metrics.
@@ -36,23 +38,50 @@ class EventTelemetry:
         self.enabled: bool = enabled
         self.window_size: int = window_size
         self.event_counts: dict[str, int] = defaultdict(int)
+        
+        # Bounded cache for per-task event counts to prevent memory leaks
+        self.task_event_counts: OrderedDict[str, dict[str, int]] = OrderedDict()
+        
         self.dispatch_latencies: deque[float] = deque(maxlen=LATENCY_WINDOW_SIZE)
         
         # RLock allows safe metric updates from various internal event hooks
         self._lock: threading.RLock = threading.RLock()
 
-    def record_dispatch(self, event_type: str, duration: float) -> None:
+    def record_dispatch(self, event_type: str, duration: float, task_name: str | None = None) -> None:
         """Logs an event dispatch and its associated latency.
         
         Args:
             event_type: The string identifier of the event (e.g., 'task-sent').
             duration: Dispatch time in seconds.
+            task_name: Optional task identifier for granular tracking.
         """
         if not self.enabled:
             return
         with self._lock:
             self.event_counts[event_type] += 1
             self.dispatch_latencies.append(duration)
+            
+            if task_name:
+                if task_name not in self.task_event_counts:
+                    if len(self.task_event_counts) >= MAX_TASK_NAMES_TRACKED:
+                        self.task_event_counts.popitem(last=False)
+                    self.task_event_counts[task_name] = defaultdict(int)
+                self.task_event_counts[task_name][event_type] += 1
+                self.task_event_counts.move_to_end(task_name)
+
+    def get_event_summary(self) -> dict[str, Any]:
+        """Returns a snapshot of event statistics.
+        
+        Returns:
+            Dictionary containing global and per-task event counts.
+        """
+        with self._lock:
+            return {
+                "global_counts": dict(self.event_counts),
+                "task_counts": {k: dict(v) for k, v in self.task_event_counts.items()},
+                "avg_dispatch_latency_ms": (sum(self.dispatch_latencies) / len(self.dispatch_latencies) * 1000)
+                                           if self.dispatch_latencies else 0.0
+            }
 
 class TelemetryDispatcher(BaseEventDispatcher):
     """Event dispatcher wrapper that captures performance metrics.
@@ -88,7 +117,10 @@ class TelemetryDispatcher(BaseEventDispatcher):
         try:
             event: Event = super().send(type_, **fields)
             duration: float = time.perf_counter() - start_time
-            self.telemetry.record_dispatch(type_, duration)
+            
+            # We attempt to extract the task name for granular tracking
+            task_name: str | None = fields.get('name')
+            self.telemetry.record_dispatch(type_, duration, task_name=task_name)
             
             # We explicitly bridge completion events to ensure worker-level latency is captured
             if self.worker_collector and type_ in ('task-succeeded', 'task-failed'):

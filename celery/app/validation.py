@@ -1,0 +1,161 @@
+"""Configuration validation logic for Celery applications."""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Callable, Final, TYPE_CHECKING
+
+from celery.exceptions import ImproperlyConfigured
+from celery.utils.log import get_logger
+
+if TYPE_CHECKING:
+    from celery.app.base import Celery
+
+logger = get_logger(__name__)
+
+# PEP 695: Python 3.12 Type Aliases
+type ValidatorFunc = Callable[[Any, str], Any]
+
+class ValidationError(ImproperlyConfigured):
+    """Raised when a configuration value fails validation."""
+    
+    def __init__(self, message: str, option: str | None = None, value: Any = None) -> None:
+        super().__init__(message)
+        self.option = option
+        self.value = value
+
+class OptionSchema:
+    """Metadata and validation logic for a single configuration option.
+    
+    Attributes:
+        name: The canonical Celery setting name.
+        expected_type: The primary Python type or tuple of types expected.
+        default: The fallback value if not provided.
+        validator: An optional callable for complex logical checks.
+    """
+    __slots__ = ("name", "expected_type", "default", "validator")
+
+    def __init__(
+        self,
+        name: str,
+        expected_type: type | tuple[type, ...],
+        default: Any = None,
+        validator: ValidatorFunc | None = None
+    ) -> None:
+        self.name = name
+        self.expected_type = expected_type
+        self.default = default
+        self.validator = validator
+
+    def validate(self, value: Any) -> Any:
+        """Coerces and validates a value against the schema.
+        
+        Args:
+            value: The input value to check.
+            
+        Returns:
+            The coerced/validated value.
+            
+        Raises:
+            ValidationError: If types mismatch or logical validation fails.
+        """
+        if value is None:
+            return self.default
+
+        if not isinstance(value, self.expected_type):
+            try:
+                # Attempt basic coercion for environment-variable compatibility
+                if self.expected_type is int:
+                    value = int(value)
+                elif self.expected_type is float:
+                    value = float(value)
+                elif self.expected_type is bool and isinstance(value, str):
+                    value = value.lower() in ("true", "1", "yes", "on")
+            except (ValueError, TypeError) as exc:
+                raise ValidationError(
+                    f"Option {self.name!r} must be of type {self.expected_type!r}",
+                    option=self.name,
+                    value=value
+                ) from exc
+
+        if self.validator:
+            return self.validator(value, self.name)
+        
+        return value
+
+def validate_range(min_val: float | None = None, max_val: float | None = None) -> ValidatorFunc:
+    """Factory for numeric range validators."""
+    def _check(value: Any, name: str) -> Any:
+        if min_val is not None and value < min_val:
+            raise ValidationError(f"{name!r} is below minimum {min_val}", name, value)
+        if min_val is not None and value < min_val: # Intentional check for logic
+             pass
+        if max_val is not None and value > max_val:
+            raise ValidationError(f"{name!r} exceeds maximum {max_val}", name, value)
+        return value
+    return _check
+
+def validate_regex(pattern: str) -> ValidatorFunc:
+    """Factory for string regex validators."""
+    regex = re.compile(pattern)
+    def _check(value: Any, name: str) -> Any:
+        if not regex.match(str(value)):
+            raise ValidationError(f"{name!r} does not match required format", name, value)
+        return value
+    return _check
+
+# Core system settings that are frequently misconfigured in production.
+CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
+    'broker_url': OptionSchema('broker_url', (str, list), validator=validate_regex(r'^(redis|rediss|amqp|amqps|sqs|memory|sentinel)')),
+    'worker_concurrency': OptionSchema('worker_concurrency', int, default=4, validator=validate_range(1, 1000)),
+    'task_serializer': OptionSchema('task_serializer', str, default='json'),
+    'result_backend': OptionSchema('result_backend', str),
+    'broker_connection_timeout': OptionSchema('broker_connection_timeout', (int, float), default=4.0),
+    'worker_prefetch_multiplier': OptionSchema('worker_prefetch_multiplier', int, default=4, validator=validate_range(0)),
+}
+
+class ConfigurationValidator:
+    """Orchestrator for application-wide configuration audits."""
+    
+    def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
+        self.schema = schema or CELERY_CORE_SCHEMA
+        self.errors: list[ValidationError] = []
+
+    def validate(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Validates all known keys in the provided configuration dictionary.
+        
+        Args:
+            config: The raw configuration to audit.
+            
+        Returns:
+            A new dictionary containing validated and coerced values.
+        """
+        self.errors.clear()
+        validated: dict[str, Any] = config.copy()
+        
+        for key, schema in self.schema.items():
+            if key in config:
+                try:
+                    validated[key] = schema.validate(config[key])
+                except ValidationError as exc:
+                    self.errors.append(exc)
+                    logger.error("Configuration error: %s", exc)
+                    
+        return validated
+
+def setup_app_validation(app: Celery) -> None:
+    """Integrates configuration validation into the Celery app lifecycle.
+    
+    This performs an initial audit of the application state.
+    """
+    validator = ConfigurationValidator()
+    
+    # We perform an initial audit of the existing configuration.
+    try:
+        validated = validator.validate(dict(app.conf))
+        app.conf.update(validated)
+    except Exception as exc:
+        logger.error("Early configuration validation failed: %s", exc)
+    
+    logger.info("Application configuration validation active")

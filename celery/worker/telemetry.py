@@ -1,4 +1,4 @@
-"""Worker pool telemetry and performance monitoring."""
+"""Worker pool telemetry collection."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Final, TYPE_CHECKING
+from typing import Any, Final, TYPE_CHECKING, Union
 
 from celery.utils.log import get_logger
 
@@ -15,60 +15,66 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# PEP 695: Python 3.12 Type Aliases
-type MetricValue = int | float
-type Timestamp = float
+# Reverted PEP 695 for backward compatibility with Python < 3.12
+MetricValue = Union[int, float]
+Timestamp = float
 
-# Constants for default monitoring behavior to avoid magic numbers in the logic
+# Configuration constants for monitoring behavior.
 DEFAULT_COLLECTION_INTERVAL: Final[float] = 60.0
 DEFAULT_HEALTH_LOG_INTERVAL: Final[float] = 300.0
 DEFAULT_WINDOW_SIZE: Final[int] = 200
 
 try:
-    from opentelemetry.metrics import Counter, Histogram, UpDownCounter, get_meter
+    from opentelemetry.metrics import Counter, Histogram, UpDownCounter, Gauge, get_meter
     _OTEL_AVAILABLE = True
 except ImportError:
-    _OTEL_AVAILABLE = False
+    # Fallback to Gauge-less or completely missing OTel
+    try:
+        from opentelemetry.metrics import Counter, Histogram, UpDownCounter, get_meter
+        Gauge = None
+        _OTEL_AVAILABLE = True
+    except ImportError:
+        _OTEL_AVAILABLE = False
 
 OTEL_AVAILABLE: Final[bool] = _OTEL_AVAILABLE
 
 @dataclass(slots=True)
 class WorkerPoolMetrics:
-    """Efficient metric aggregator for Celery worker pools.
+    """Aggregator for worker pool performance metrics.
     
-    This class maintains rolling windows of performance data to provide 
-    statistically significant averages while preventing unbounded memory growth.
+    Maintains rolling windows of performance data to compute averages while 
+    constraining memory growth.
     
     Attributes:
-        job_queue_depths: History of queue lengths for trend analysis.
+        job_queue_depths: History of observed queue lengths.
         processing_latencies: History of task execution times.
-        jobs_processed: Lifetime count of successful task completions.
-        jobs_failed: Lifetime count of task failures.
+        jobs_processed: Count of successful task completions.
+        jobs_failed: Count of task failures.
     """
     
     job_queue_depths: deque[int] = field(default_factory=lambda: deque(maxlen=DEFAULT_WINDOW_SIZE))
     processing_latencies: deque[float] = field(default_factory=lambda: deque(maxlen=DEFAULT_WINDOW_SIZE))
     
-    # Pre-calculated sums allow O(1) average computation regardless of window size
+    # Pre-calculated sums allow O(1) average computation.
     _queue_depths_sum: int = 0
     _processing_latencies_sum: float = 0.0
     
-    # RLock ensures atomic updates during concurrent task events in multi-threaded pools
+    # RLock ensures atomic updates during concurrent events.
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     
     jobs_processed: int = 0
     jobs_failed: int = 0
     
-    # System resource snapshots
+    # System resource snapshots.
     memory_mb: float = 0.0
     cpu_percent: float = 0.0
     
-    # Thresholds for operational alerting
+    # Thresholds for operational alerting.
     alert_queue_depth_threshold: int = 1000
     alert_latency_threshold_ms: float = 5000.0
 
     def record_queue_depth(self, depth: int) -> None:
-        """Appends a new queue depth observation to the rolling window.
+        """Adds a queue depth observation to the rolling window.
         
         Args:
             depth: Observed number of tasks in the pool queue.
@@ -79,15 +85,14 @@ class WorkerPoolMetrics:
             self.job_queue_depths.append(depth)
             self._queue_depths_sum += depth
             
-        # Alerting is decoupled from metrics storage to reduce lock contention
         if depth > self.alert_queue_depth_threshold:
             logger.warning("Worker queue pressure detected: %d tasks", depth)
 
     def record_latency(self, start_time: Timestamp) -> None:
-        """Calculates task latency and updates the rolling history.
+        """Calculates task latency and updates rolling history.
         
         Args:
-            start_time: High-precision timestamp from the start of execution.
+            start_time: High-resolution timestamp from start of execution.
         """
         latency: float = time.perf_counter() - start_time
         with self._lock:
@@ -98,30 +103,28 @@ class WorkerPoolMetrics:
 
     @property
     def avg_queue_depth(self) -> float:
-        """Computes the moving average of the queue depth window."""
+        """Computes moving average of the queue depth window."""
         with self._lock:
             return self._queue_depths_sum / len(self.job_queue_depths) if self.job_queue_depths else 0.0
 
     @property
     def avg_latency_ms(self) -> float:
-        """Computes the moving average of task latency in milliseconds."""
+        """Computes moving average of task latency in milliseconds."""
         with self._lock:
             count: int = len(self.processing_latencies)
             return (self._processing_latencies_sum / count * 1000) if count > 0 else 0.0
 
 
 class TelemetryCollector:
-    """Unified controller for telemetry collection and OTel export.
+    """Manager for telemetry collection and OTel instrumentation.
     
-    This collector acts as a singleton manager that bridges Celery lifecycle
-    events with observability backends.
+    Acts as a gateway routing metrics to internal aggregators or OTel providers.
     """
     
-    # OTel instruments initialized only if available to prevent dependency errors
-    queue_depth_gauge: UpDownCounter | None = None
+    queue_depth_gauge: Any | None = None
     latency_histogram: Histogram | None = None
     completed_counter: Counter | None = None
-    memory_gauge: UpDownCounter | None = None
+    memory_gauge: Any | None = None
 
     def __init__(
         self, 
@@ -129,12 +132,12 @@ class TelemetryCollector:
         prefer_otel: bool = True,
         meter_name: str = "celery.worker.telemetry"
     ) -> None:
-        """Initializes the telemetry lifecycle manager.
+        """Initializes the telemetry manager.
         
         Args:
-            enabled: Opt-in flag for metrics collection.
-            prefer_otel: Attempt to use OpenTelemetry if available.
-            meter_name: Namespace for OTel instrument grouping.
+            enabled: Whether metrics collection is active.
+            prefer_otel: Use OpenTelemetry if available.
+            meter_name: Namespace for OTel instruments.
         """
         self.enabled: bool = enabled
         self.otel_enabled: bool = enabled and prefer_otel and OTEL_AVAILABLE
@@ -144,12 +147,19 @@ class TelemetryCollector:
             self._setup_otel(meter_name)
 
     def _setup_otel(self, meter_name: str) -> None:
-        """Initializes OpenTelemetry instruments for external export."""
+        """Initializes OpenTelemetry instruments."""
         meter = get_meter(meter_name)
-        self.queue_depth_gauge = meter.create_up_down_counter("celery.jobs.queue_depth")
+        # Use Gauge for snapshots to prevent cumulative corruption in backends.
+        if Gauge:
+            self.queue_depth_gauge = meter.create_gauge("celery.jobs.queue_depth")
+            self.memory_gauge = meter.create_gauge("celery.worker.memory_mb")
+        else:
+            # Fallback to UpDownCounter only if Gauge is unavailable in old OTel versions
+            self.queue_depth_gauge = meter.create_up_down_counter("celery.jobs.queue_depth")
+            self.memory_gauge = meter.create_up_down_counter("celery.worker.memory_mb")
+            
         self.latency_histogram = meter.create_histogram("celery.jobs.latency")
         self.completed_counter = meter.create_counter("celery.jobs.completed")
-        self.memory_gauge = meter.create_up_down_counter("celery.worker.memory_mb")
 
     def record_job_received(self, queue_depth: int) -> None:
         """Hook for task arrival events."""
@@ -158,7 +168,10 @@ class TelemetryCollector:
         if self.metrics:
             self.metrics.record_queue_depth(queue_depth)
         if self.otel_enabled and self.queue_depth_gauge:
-            self.queue_depth_gauge.add(queue_depth)
+            if Gauge and isinstance(self.queue_depth_gauge, Gauge):
+                self.queue_depth_gauge.set(queue_depth)
+            else:
+                self.queue_depth_gauge.add(queue_depth)
 
     def record_job_completed(self, start_time: Timestamp, success: bool) -> None:
         """Hook for task completion events."""
@@ -179,10 +192,10 @@ class TelemetryCollector:
                 self.completed_counter.add(1, {"status": "success" if success else "failure"})
 
     def record_resource_usage(self, memory_mb: float, cpu_percent: float) -> None:
-        """Updates system resource metrics in the telemetry stream.
+        """Updates system resource metrics.
         
         Args:
-            memory_mb: RSS memory usage in megabytes.
+            memory_mb: RSS memory usage in MB.
             cpu_percent: Process CPU utilization percentage.
         """
         if not self.enabled:
@@ -191,11 +204,13 @@ class TelemetryCollector:
             self.metrics.memory_mb = memory_mb
             self.metrics.cpu_percent = cpu_percent
         if self.otel_enabled and self.memory_gauge:
-            # Gauge values are rounded to nearest integer to satisfy standard OTel backends
-            self.memory_gauge.add(int(memory_mb))
+            if Gauge and isinstance(self.memory_gauge, Gauge):
+                self.memory_gauge.set(int(memory_mb))
+            else:
+                self.memory_gauge.add(int(memory_mb))
 
     def get_summary(self) -> dict[str, Any] | None:
-        """Returns a snapshot of worker health for monitoring dashboards."""
+        """Returns a snapshot of current metrics."""
         if not self.enabled or not self.metrics:
             return None
         return {
@@ -210,19 +225,23 @@ class TelemetryCollector:
         }
 
 _collector: TelemetryCollector | None = None
+_collector_lock = threading.Lock()
 
 def get_collector() -> TelemetryCollector:
-    """Global access to the telemetry collector singleton."""
+    """Access the global telemetry collector singleton."""
     global _collector
     if _collector is None:
-        _collector = TelemetryCollector()
+        with _collector_lock:
+            if _collector is None:
+                _collector = TelemetryCollector()
     return _collector
 
 def init_telemetry(enabled: bool = False) -> None:
-    """Initializes or resets the global telemetry state.
+    """Initializes or resets the telemetry state.
     
     Args:
-        enabled: Initial state for the collector.
+        enabled: Initial activation state.
     """
     global _collector
-    _collector = TelemetryCollector(enabled=enabled)
+    with _collector_lock:
+        _collector = TelemetryCollector(enabled=enabled)
