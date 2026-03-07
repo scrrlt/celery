@@ -23,6 +23,7 @@ class ResourceUsage(TypedDict):
     """System resource utilization schema."""
     memory_mb: float
     cpu_percent: float
+    max_cpu_percent: float
 
 class TelemetrySummary(TypedDict):
     """Worker performance snapshot schema."""
@@ -59,49 +60,46 @@ except ImportError:
 
 OTEL_AVAILABLE: Final[bool] = _OTEL_AVAILABLE
 
-@dataclass
 class WorkerPoolMetrics:
     """Maintain O(1) running averages via EMA to prevent memory growth.
     
-    Uses multiprocessing.Value to ensure metrics are shared across prefork 
-    child processes and visible to the parent process metrics endpoint.
+    Adopts shared memory via multiprocessing.Value for aggregate visibility 
+    across prefork child processes.
     """
     
-    # Thresholds for operational alerting.
-    alert_queue_depth_threshold: int = 1000
-    alert_latency_threshold_ms: float = 5000.0
-    _warmup_window: int = 10
-
-    def __post_init__(self) -> None:
-        """Initialize shared memory counters and averages."""
-        # Shared counters for prefork compatibility
-        self._jobs_processed = multiprocessing.Value('i', 0)
-        self._jobs_failed = multiprocessing.Value('i', 0)
-        self._jobs_retried = multiprocessing.Value('i', 0)
+    def __init__(
+        self,
+        jobs_processed: multiprocessing.Value,
+        jobs_failed: multiprocessing.Value,
+        jobs_retried: multiprocessing.Value,
+        avg_queue_depth: multiprocessing.Value,
+        avg_latency_ms: multiprocessing.Value,
+        avg_queue_latency_ms: multiprocessing.Value,
+        queue_depth_samples: multiprocessing.Value,
+        latency_samples: multiprocessing.Value,
+        queue_latency_samples: multiprocessing.Value,
+        memory_mb: multiprocessing.Value,
+        cpu_percent: multiprocessing.Value,
+        max_cpu_percent: multiprocessing.Value,
+        lock: multiprocessing.RLock
+    ) -> None:
+        self._jobs_processed = jobs_processed
+        self._jobs_failed = jobs_failed
+        self._jobs_retried = jobs_retried
+        self._avg_queue_depth = avg_queue_depth
+        self._avg_latency_ms = avg_latency_ms
+        self._avg_queue_latency_ms = avg_queue_latency_ms
+        self._queue_depth_samples = queue_depth_samples
+        self._latency_samples = latency_samples
+        self._queue_latency_samples = queue_latency_samples
+        self._memory_mb = memory_mb
+        self._cpu_percent = cpu_percent
+        self._max_cpu_percent = max_cpu_percent
+        self._lock = lock
         
-        self._avg_queue_depth = multiprocessing.Value('d', 0.0)
-        self._avg_latency_ms = multiprocessing.Value('d', 0.0)
-        self._avg_queue_latency_ms = multiprocessing.Value('d', 0.0)
-        
-        self._queue_depth_samples = multiprocessing.Value('i', 0)
-        self._latency_samples = multiprocessing.Value('i', 0)
-        self._queue_latency_samples = multiprocessing.Value('i', 0)
-        
-        self._memory_mb = multiprocessing.Value('d', 0.0)
-        self._cpu_percent = multiprocessing.Value('d', 0.0)
-        
-        self._lock = multiprocessing.RLock()
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Allow serialization by excluding non-picklable components."""
-        state = self.__dict__.copy()
-        # multiprocessing.Value/Lock are picklable by default via inheritance 
-        # in prefork, but we ensure clean state transfer.
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore state after deserialization."""
-        self.__dict__.update(state)
+        self.alert_queue_depth_threshold = 1000
+        self.alert_latency_threshold_ms = 5000.0
+        self._warmup_window = 10
 
     @property
     def jobs_processed(self) -> int: return self._jobs_processed.value
@@ -119,6 +117,8 @@ class WorkerPoolMetrics:
     def memory_mb(self) -> float: return self._memory_mb.value
     @property
     def cpu_percent(self) -> float: return self._cpu_percent.value
+    @property
+    def max_cpu_percent(self) -> float: return self._max_cpu_percent.value
 
     def record_queue_depth(self, depth: int) -> None:
         """Update queue depth average using bias-corrected EMA."""
@@ -137,7 +137,7 @@ class WorkerPoolMetrics:
             logger.warning("Worker queue pressure detected: %d tasks", depth)
 
     def record_latency(self, latency: float) -> None:
-        """Update task execution latency average using bias-corrected EMA."""
+        """Update execution latency average using bias-corrected EMA."""
         latency_ms = latency * 1000.0
         if self._lock.acquire(blocking=False):
             try:
@@ -151,7 +151,7 @@ class WorkerPoolMetrics:
                 self._lock.release()
 
     def record_queue_latency(self, latency: float) -> None:
-        """Update queue wait time average (time-of-flight) using EMA."""
+        """Update queue wait time average using bias-corrected EMA."""
         latency_ms = latency * 1000.0
         if self._lock.acquire(blocking=False):
             try:
@@ -169,8 +169,15 @@ class WorkerPoolMetrics:
     def increment_retried(self) -> None: self._jobs_retried.value += 1
     
     def update_resources(self, memory_mb: float, cpu_percent: float) -> None:
+        """Update resource snapshots and track peak CPU bursts."""
         self._memory_mb.value = memory_mb
         self._cpu_percent.value = cpu_percent
+        if cpu_percent > self._max_cpu_percent.value:
+            self._max_cpu_percent.value = cpu_percent
+
+    def reset_max_cpu(self) -> None:
+        """Reset peak CPU tracker for new measurement window."""
+        self._max_cpu_percent.value = 0.0
 
 
 class TelemetryCollector:
@@ -189,10 +196,28 @@ class TelemetryCollector:
         prefer_otel: bool = True,
         meter_name: str = "celery.worker.telemetry"
     ) -> None:
-        """Initialize telemetry manager."""
-        self.enabled: bool = enabled
-        self.otel_enabled: bool = enabled and prefer_otel and OTEL_AVAILABLE
-        self.metrics: WorkerPoolMetrics | None = WorkerPoolMetrics() if enabled else None
+        """Initialize telemetry manager and shared metrics segment."""
+        self.enabled = enabled
+        self.otel_enabled = enabled and prefer_otel and OTEL_AVAILABLE
+        self.metrics: WorkerPoolMetrics | None = None
+        
+        if enabled:
+            # Persistent shared memory segment to avoid leaks during pool restarts.
+            self.metrics = WorkerPoolMetrics(
+                jobs_processed=multiprocessing.Value('i', 0),
+                jobs_failed=multiprocessing.Value('i', 0),
+                jobs_retried=multiprocessing.Value('i', 0),
+                avg_queue_depth=multiprocessing.Value('d', 0.0),
+                avg_latency_ms=multiprocessing.Value('d', 0.0),
+                avg_queue_latency_ms=multiprocessing.Value('d', 0.0),
+                queue_depth_samples=multiprocessing.Value('i', 0),
+                latency_samples=multiprocessing.Value('i', 0),
+                queue_latency_samples=multiprocessing.Value('i', 0),
+                memory_mb=multiprocessing.Value('d', 0.0),
+                cpu_percent=multiprocessing.Value('d', 0.0),
+                max_cpu_percent=multiprocessing.Value('d', 0.0),
+                lock=multiprocessing.RLock()
+            )
         
         if self.otel_enabled:
             self._setup_otel(meter_name)
@@ -253,17 +278,12 @@ class TelemetryCollector:
             self.queue_latency_histogram.record(latency)
 
     def record_job_completed(self, start_time: Timestamp, status: str = 'success') -> None:
-        """Hook for task completion events.
-        
-        Args:
-            start_time: High-resolution start timestamp.
-            status: One of 'success', 'failure', 'retry'.
-        """
+        """Log task completion events."""
         if not self.enabled or start_time <= 0:
             return
         
         # Record timestamp before lock acquisition to minimize contention.
-        latency: float = time.perf_counter() - start_time
+        latency = time.perf_counter() - start_time
         
         if self.metrics:
             self.metrics.record_latency(latency)
@@ -308,7 +328,8 @@ class TelemetryCollector:
             "jobs_retried": self.metrics.jobs_retried,
             "resource_usage": {
                 "memory_mb": self.metrics.memory_mb,
-                "cpu_percent": self.metrics.cpu_percent
+                "cpu_percent": self.metrics.cpu_percent,
+                "max_cpu_percent": self.metrics.max_cpu_percent
             }
         }
 

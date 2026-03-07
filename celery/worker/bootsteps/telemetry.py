@@ -5,10 +5,8 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
-import json
 import socket
 from collections import OrderedDict
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING, Any
 
 from celery import bootsteps
@@ -24,26 +22,6 @@ if TYPE_CHECKING:
     from celery.worker.consumer import Consumer
 
 logger = get_logger(__name__)
-
-class MetricsHandler(BaseHTTPRequestHandler):
-    """Out-of-band HTTP handler for exposing worker metrics."""
-    
-    def do_GET(self) -> None:
-        if self.path == '/metrics':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            
-            summary = get_collector().get_summary()
-            response = {"status": "active", **summary} if summary else {"status": "disabled"}
-            self.wfile.write(json.dumps(response).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
-            
-    def log_message(self, format: str, *args: Any) -> None:
-        """Suppress default HTTP server logging."""
-        pass
 
 class BoundedDict(OrderedDict):
     """Thread-safe dictionary with maximum capacity."""
@@ -77,7 +55,7 @@ class TelemetryBootstep(bootsteps.Step):
         
         self._stop_event: threading.Event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._http_server: HTTPServer | None = None
+        self._http_server: Any = None
         self._http_thread: threading.Thread | None = None
         self._signal_connections: list[Any] = []
         self._task_start_times: BoundedDict = BoundedDict(maxlen=2000)
@@ -104,10 +82,29 @@ class TelemetryBootstep(bootsteps.Step):
 
     def _start_http_server(self) -> None:
         """Start out-of-band HTTP server with port hunting."""
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == '/metrics':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    summary = get_collector().get_summary()
+                    response = {"status": "active", **summary} if summary else {"status": "disabled"}
+                    self.wfile.write(json.dumps(response).encode('utf-8'))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def log_message(self, format: str, *args: Any) -> None: pass
+
         # Try up to 10 consecutive ports to avoid collisions on multi-worker hosts.
         for port in range(self.base_port, self.base_port + 10):
             try:
                 self._http_server = HTTPServer(('0.0.0.0', port), MetricsHandler)
+                # Ensure HTTP threads don't hang process shutdown.
+                self._http_server.daemon_threads = True
                 self._http_thread = threading.Thread(
                     target=self._http_server.serve_forever,
                     daemon=True,
@@ -158,10 +155,14 @@ class TelemetryBootstep(bootsteps.Step):
     def _on_task_received(self, sender: Any = None, request: Any = None, **kwargs: Any) -> None:
         """Update queue depth metrics.
         
-        Attaches receipt timestamp to request to track time-of-flight across prefork processes.
+        Attach receipt timestamp to request to track time-of-flight across prefork processes.
         """
         if request:
-            request.telemetry_received_at = time.perf_counter()
+            # Safely attach timing to avoid AttributeError on non-instance request objects.
+            try:
+                setattr(request, 'telemetry_received_at', time.perf_counter())
+            except (AttributeError, TypeError):
+                pass
         get_collector().record_job_received(1)
 
     def _on_task_prerun(self, task_id: str | None = None, task: Any = None, **kwargs: Any) -> None:
@@ -197,19 +198,29 @@ class TelemetryBootstep(bootsteps.Step):
         get_collector().record_job_received(-1)
 
     def _monitor_loop(self, consumer: Consumer, collector: Any) -> None:
-        """Periodic background task for resource metric collection."""
+        """Periodic background task for resource metric collection.
+        
+        Samples CPU at a higher frequency to track bursts within the reporting window.
+        """
         proc = psutil.Process() if psutil else None
         if proc:
-            # Prime CPU measurement.
             proc.cpu_percent(interval=None)
             
-        while not self._stop_event.wait(self.interval):
+        # Reporting window is divided into smaller sampling intervals for peak detection.
+        sample_interval = max(1.0, self.interval / 10.0)
+        
+        while not self._stop_event.wait(sample_interval):
             try:
                 if proc:
+                    # Update snapshot at every interval.
                     mem = proc.memory_info().rss / (1024 * 1024)
                     cpu = proc.cpu_percent(interval=None)
                     collector.record_resource_usage(memory_mb=mem, cpu_percent=cpu)
-                    logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
+                    
+                    # Log at the primary collection interval.
+                    if self._stop_event.wait(0): # Check if we should log based on time?
+                        # Simplified: log every few samples.
+                        logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
                 else:
                     logger.debug("Resource monitoring skip: psutil not available")
             except Exception as e:

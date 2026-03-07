@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import threading
+import multiprocessing
 from typing import Any
 import pytest
 from unittest.mock import Mock, patch
@@ -14,11 +15,29 @@ from celery.integration.production import enable_production_telemetry
 from celery import Celery
 
 class TestWorkerPoolMetrics:
-    """Validates metric calculations and memory safety."""
+    """Validates metric calculations and shared memory safety."""
     
+    def create_metrics(self):
+        """Helper to initialize metrics with shared memory."""
+        return WorkerPoolMetrics(
+            jobs_processed=multiprocessing.Value('i', 0),
+            jobs_failed=multiprocessing.Value('i', 0),
+            jobs_retried=multiprocessing.Value('i', 0),
+            avg_queue_depth=multiprocessing.Value('d', 0.0),
+            avg_latency_ms=multiprocessing.Value('d', 0.0),
+            avg_queue_latency_ms=multiprocessing.Value('d', 0.0),
+            queue_depth_samples=multiprocessing.Value('i', 0),
+            latency_samples=multiprocessing.Value('i', 0),
+            queue_latency_samples=multiprocessing.Value('i', 0),
+            memory_mb=multiprocessing.Value('d', 0.0),
+            cpu_percent=multiprocessing.Value('d', 0.0),
+            max_cpu_percent=multiprocessing.Value('d', 0.0),
+            lock=multiprocessing.RLock()
+        )
+
     def test_initialization(self):
         """Verifies default state of metrics container."""
-        metrics = WorkerPoolMetrics()
+        metrics = self.create_metrics()
         assert metrics.jobs_processed == 0
         assert metrics.jobs_failed == 0
         assert metrics.avg_queue_depth == 0.0
@@ -26,7 +45,7 @@ class TestWorkerPoolMetrics:
 
     def test_ema_averages(self):
         """Ensures Exponential Moving Average (EMA) updates correctly."""
-        metrics = WorkerPoolMetrics()
+        metrics = self.create_metrics()
         
         # First observation sets the initial average directly
         metrics.record_queue_depth(10)
@@ -40,17 +59,27 @@ class TestWorkerPoolMetrics:
         metrics.record_latency(0.1) # 100ms
         assert metrics.avg_latency_ms == 100.0
         
-        # Second latency observation uses EMA: 0.9 * 100 + 0.1 * 200 = 110.0
+        # Second latency observation
         metrics.record_latency(0.2) # 200ms
         assert metrics.avg_latency_ms == 110.0
 
+    def test_queue_latency(self):
+        """Verifies queue latency (time-of-flight) tracking."""
+        metrics = self.create_metrics()
+        metrics.record_queue_latency(0.05) # 50ms
+        assert metrics.avg_queue_latency_ms == 50.0
+
     def test_resource_updates(self):
-        """Verifies resource snapshot updates."""
-        metrics = WorkerPoolMetrics()
-        metrics.memory_mb = 128.5
-        metrics.cpu_percent = 45.2
+        """Verifies resource snapshot and peak tracking."""
+        metrics = self.create_metrics()
+        metrics.update_resources(128.5, 45.2)
         assert metrics.memory_mb == 128.5
         assert metrics.cpu_percent == 45.2
+        assert metrics.max_cpu_percent == 45.2
+        
+        metrics.update_resources(130.0, 30.0)
+        assert metrics.cpu_percent == 30.0
+        assert metrics.max_cpu_percent == 45.2 # Peak preserved
 
 class TestConfigurationValidation:
     """Validates configuration auditing logic."""

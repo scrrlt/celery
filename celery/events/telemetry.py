@@ -39,12 +39,12 @@ class EventTelemetry:
     
     def __init__(self, enabled: bool = False, track_tasks: bool = False) -> None:
         """Initialize telemetry aggregator."""
-        self.enabled: bool = enabled
-        self.track_tasks: bool = track_tasks
+        self.enabled = enabled
+        self.track_tasks = track_tasks
         self.event_counts: OrderedDict[str, int] = OrderedDict()
         self.task_event_counts: OrderedDict[str, dict[str, int]] = OrderedDict()
-        self.avg_dispatch_latency_ms: float = 0.0
-        self._lock: threading.RLock = threading.RLock()
+        self.avg_dispatch_latency_ms = 0.0
+        self._lock = threading.RLock()
 
     def __getstate__(self) -> dict[str, Any]:
         """Exclude lock from serialization."""
@@ -66,7 +66,6 @@ class EventTelemetry:
         
         if self._lock.acquire(blocking=False):
             try:
-                # Track global event types with bounding.
                 if event_type not in self.event_counts:
                     if len(self.event_counts) >= MAX_EVENT_TYPES_TRACKED:
                         self.event_counts.popitem(last=False)
@@ -74,7 +73,6 @@ class EventTelemetry:
                 self.event_counts[event_type] += 1
                 self.event_counts.move_to_end(event_type)
                 
-                # Update EMA for dispatch latency.
                 if self.avg_dispatch_latency_ms == 0.0:
                     self.avg_dispatch_latency_ms = latency_ms
                 else:
@@ -105,12 +103,12 @@ class TelemetryDispatcher(BaseEventDispatcher):
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize dispatcher with sampling support."""
-        enable_telemetry: bool = kwargs.pop('enable_telemetry', False)
-        track_tasks: bool = kwargs.pop('telemetry_track_tasks', False)
-        self.sample_rate: float = kwargs.pop('telemetry_sample_rate', 1.0)
+        enable_telemetry = kwargs.pop('enable_telemetry', False)
+        track_tasks = kwargs.pop('telemetry_track_tasks', False)
+        self.sample_rate = kwargs.pop('telemetry_sample_rate', 1.0)
         
         super().__init__(*args, **kwargs)
-        self.telemetry: EventTelemetry = EventTelemetry(
+        self.telemetry = EventTelemetry(
             enabled=enable_telemetry, 
             track_tasks=track_tasks
         )
@@ -118,20 +116,17 @@ class TelemetryDispatcher(BaseEventDispatcher):
 
     def send(self, type_: str, **fields: Any) -> Event:
         """Intercept send call to record metrics with sampling."""
-        # Performance optimization: Skip metrics if disabled or via sampling.
         if not self.telemetry.enabled or (self.sample_rate < 1.0 and random.random() > self.sample_rate):
             return super().send(type_, **fields)
 
-        start_time: float = time.perf_counter()
+        start_time = time.perf_counter()
         try:
-            event: Event = super().send(type_, **fields)
-            duration: float = time.perf_counter() - start_time
+            event = super().send(type_, **fields)
+            duration = time.perf_counter() - start_time
             
-            # Extract task name robustly.
-            task_name: str | None = fields.get('task') or fields.get('name')
+            task_name = fields.get('task') or fields.get('name')
             self.telemetry.record_dispatch(type_, duration, task_name=task_name)
             
-            # Bridge task lifecycle events for worker visibility.
             if self.worker_collector:
                 if type_ == 'task-succeeded':
                     self.worker_collector.record_job_completed(fields.get('timestamp', 0.0), status='success')

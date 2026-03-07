@@ -1,11 +1,11 @@
-"""Configuration validation logic for Celery applications."""
+"""Configuration validation for Celery applications."""
 
 from __future__ import annotations
 
 import logging
 import re
 import functools
-from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable
+from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable, final
 
 from celery.exceptions import ImproperlyConfigured
 from celery.utils.log import get_logger
@@ -26,8 +26,9 @@ class ValidationError(ImproperlyConfigured):
         self.option = option
         self.value = value
 
+@final
 class OptionSchema:
-    """Metadata and validation logic for a configuration option.
+    """Schema and validation for a Celery configuration setting.
     
     Attributes:
         name: Canonical Celery setting name.
