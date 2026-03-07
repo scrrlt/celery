@@ -63,6 +63,7 @@ class BoundedDict(OrderedDict):
     def items_snapshot(self) -> Dict[Any, Any]:
         """Return a thread-safe copy of current items."""
         with self._lock:
+            # Traverse once to minimize lock contention.
             return dict(self.items())
 
 class TelemetryBootstep(bootsteps.Step):
@@ -109,7 +110,7 @@ class TelemetryBootstep(bootsteps.Step):
         self._start_http_server()
 
     def _start_http_server(self) -> None:
-        """Start out-of-band HTTP server with port hunting and client timeouts."""
+        """Start out-of-band HTTP server with port hunting and timeouts."""
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import json
 
@@ -200,6 +201,7 @@ class TelemetryBootstep(bootsteps.Step):
         """
         if request:
             try:
+                # Use internal prefix to avoid collision and detect initial arrival.
                 if not hasattr(request, '_celery_telemetry_rx'):
                     setattr(request, '_celery_telemetry_rx', time.perf_counter())
             except (AttributeError, TypeError):

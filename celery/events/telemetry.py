@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# PEP 613: TypeAlias for backward compatibility with Python < 3.12
+# PEP 613: TypeAlias for backward compatibility.
 EventSummary: TypeAlias = dict[str, Any]
 
 # Bounding limits for telemetry tracking.
@@ -92,12 +92,16 @@ class EventTelemetry:
         try:
             self._queue.put_nowait((event_type, duration, task_name))
         except queue.Full:
-            pass # Drop metrics under pressure.
+            pass # Drop metrics under pressure to protect hot path.
 
     def stop(self) -> None:
         """Stop metrics processor and flush queue."""
         if self.enabled and self._worker_thread:
-            self._queue.put(None)
+            try:
+                # Use timeout to prevent shutdown deadlock if queue is full.
+                self._queue.put(None, timeout=1.0)
+            except queue.Full:
+                logger.warning("Telemetry queue full during shutdown; metrics may be dropped.")
             self._worker_thread.join(timeout=2.0)
 
     def _process_queue(self) -> None:

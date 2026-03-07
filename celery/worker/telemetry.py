@@ -356,10 +356,9 @@ class TelemetryCollector:
         if not self.enabled or not self.metrics:
             return None
             
-        # Bias-corrected EMA summary logic.
+        # Standard EMA Bias Correction: v_t / (1 - beta^t)
         def _correct(val: float, count: int) -> float:
             if count == 0: return 0.0
-            # Standard bias correction: v_t / (1 - beta^t)
             beta_t = (1.0 - self.metrics._alpha) ** count
             return val / (1.0 - beta_t)
 

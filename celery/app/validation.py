@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import functools
-from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable, Union
+from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable, Union, get_args, get_origin
 
 try:
     from typing import TypeAlias, final
@@ -51,11 +51,16 @@ class OptionSchema:
         validator: ValidatorFunc | None = None
     ) -> None:
         self.name = name
-        # Normalize expected_type to handle PEP 604 (int | float) on Python < 3.10.
-        if hasattr(expected_type, "__args__"):
+        
+        # Use standard library introspection to safely unwrap Unions/PEP 604 types.
+        origin = get_origin(expected_type)
+        if origin is Union or (hasattr(re, 'Pattern') and origin is getattr(Union, '__class__', None)): # Fallback for old versions
+            self.expected_type = get_args(expected_type)
+        elif hasattr(expected_type, "__args__"): # PEP 604 (int | float) on some versions
             self.expected_type = expected_type.__args__
         else:
             self.expected_type = expected_type
+            
         self.default = default
         self.validator = validator
 
@@ -71,7 +76,6 @@ class OptionSchema:
         if not isinstance(value, self.expected_type):
             types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
             
-            # Retry-loop for coercion ensures all allowed types are checked.
             success = False
             for target_type in types:
                 try:
