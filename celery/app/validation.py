@@ -34,7 +34,7 @@ class ValidationError(ImproperlyConfigured):
 @final
 class OptionSchema:
     """Schema and validation for a Celery configuration setting.
-    
+
     Attributes:
         name: Canonical Celery setting name.
         expected_type: Expected Python type or tuple of types.
@@ -66,7 +66,6 @@ class OptionSchema:
 
         if not isinstance(value, self.expected_type):
             try:
-                # Support for tuple expected_type in identity-based coercion
                 types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
                 
                 if int in types:
@@ -74,7 +73,14 @@ class OptionSchema:
                 elif float in types:
                     value = float(value)
                 elif bool in types and isinstance(value, str):
-                    value = value.lower() in ("true", "1", "yes", "on")
+                    # Strict boolean coercion to prevent silent misconfiguration.
+                    normalized = value.lower()
+                    if normalized in ("true", "1", "yes", "on"):
+                        value = True
+                    elif normalized in ("false", "0", "no", "off"):
+                        value = False
+                    else:
+                        raise ValueError(f"Invalid boolean string: {value!r}")
             except (ValueError, TypeError) as exc:
                 raise ValidationError(
                     f"Option {self.name!r} must be of type {self.expected_type!r}",

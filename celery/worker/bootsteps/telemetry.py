@@ -49,21 +49,22 @@ class BoundedDict(OrderedDict):
             return super().pop(key, default)
 
     def update(self, *args: Any, **kwargs: Any) -> None:
-        """Thread-safe batch update."""
+        """Perform thread-safe batch update."""
         with self._lock:
             super().update(*args, **kwargs)
             while len(self) > self.maxlen:
                 self.popitem(last=False)
 
     def clear(self) -> None:
-        """Thread-safe clear."""
+        """Perform thread-safe clear."""
         with self._lock:
             super().clear()
 
     def items_snapshot(self) -> Dict[Any, Any]:
         """Return a thread-safe copy of current items."""
         with self._lock:
-            return dict(self.items())
+            # OrderedDict.copy() is highly optimized in CPython.
+            return dict(self.copy())
 
 class TelemetryBootstep(bootsteps.Step):
     """Integrated telemetry collection via Celery bootstep lifecycle."""
@@ -93,7 +94,6 @@ class TelemetryBootstep(bootsteps.Step):
         init_telemetry(enabled=True)
         collector = get_collector()
         
-        # Immediate OTel setup for single-process environments.
         if getattr(consumer.pool, 'is_single_process', False):
             collector.setup_otel()
         
@@ -128,16 +128,13 @@ class TelemetryBootstep(bootsteps.Step):
                     self.end_headers()
             def log_message(self, format: str, *args: Any) -> None: pass
 
-        # Attempt to bind within a 10-port range.
         for port in range(self.base_port, self.base_port + 10):
             try:
-                # Use SO_REUSEADDR to avoid port exhaustion during rapid restarts.
                 self._http_server = ThreadingHTTPServer(('0.0.0.0', port), MetricsHandler, bind_and_activate=False)
                 self._http_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self._http_server.server_bind()
                 self._http_server.server_activate()
                 
-                # Set timeouts to prevent thread exhaustion from slow clients.
                 self._http_server.socket.settimeout(5.0)
                 self._http_server.daemon_threads = True
                 
@@ -147,7 +144,7 @@ class TelemetryBootstep(bootsteps.Step):
                     name="CeleryTelemetryHTTP"
                 )
                 self._http_thread.start()
-                logger.info("Worker telemetry active. Metrics at http://0.0.0.0:%d/metrics", port)
+                logger.info("Worker telemetry active. Bound to port %d. Metrics at /metrics", port)
                 return
             except socket.error as e:
                 if port == self.base_port + 9:
@@ -194,10 +191,15 @@ class TelemetryBootstep(bootsteps.Step):
         get_collector().setup_otel()
 
     def _on_task_received(self, sender: Any = None, request: Any = None, **kwargs: Any) -> None:
-        """Update queue depth metrics."""
+        """Update queue depth metrics.
+        
+        Assigns internal timestamp to request to track time-of-flight.
+        """
         if request:
             try:
-                setattr(request, 'telemetry_received_at', time.perf_counter())
+                # Use internal prefix to avoid collision and detect initial arrival.
+                if not hasattr(request, '_celery_telemetry_rx'):
+                    setattr(request, '_celery_telemetry_rx', time.perf_counter())
             except (AttributeError, TypeError):
                 pass
         get_collector().record_job_received(1)
@@ -208,8 +210,9 @@ class TelemetryBootstep(bootsteps.Step):
         if task:
             task._telemetry_start_time = now
             request = getattr(task, 'request', None)
-            if request and hasattr(request, 'telemetry_received_at'):
-                queue_latency = now - request.telemetry_received_at
+            rx_time = getattr(request, '_celery_telemetry_rx', None)
+            if rx_time:
+                queue_latency = now - rx_time
                 get_collector().record_queue_latency(queue_latency)
                 logger.debug("Task %s queue latency: %.4fs", task_id, queue_latency)
 
@@ -256,7 +259,7 @@ class TelemetryBootstep(bootsteps.Step):
                     # Log heartbeat every 10 samples (matching reporting interval).
                     if sample_count % 10 == 0:
                         logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
-                    consecutive_errors = 0 # Reset on success
+                    consecutive_errors = 0 
                 else:
                     logger.debug("Resource monitoring skip: psutil not available")
             except Exception as e:

@@ -104,7 +104,19 @@ class WorkerPoolMetrics:
         
         self.alert_queue_depth_threshold = 1000
         self.alert_latency_threshold_ms = 5000.0
-        self._warmup_window = 10
+        # Larger warm-up window to ensure EMA stability.
+        self._warmup_window = 100
+
+    def shutdown(self) -> None:
+        """Release or zero shared memory handles."""
+        # billiard.Value doesn't require explicit close, but we zero them.
+        with self._lock:
+            self._jobs_processed.value = 0
+            self._jobs_failed.value = 0
+            self._jobs_retried.value = 0
+            self._avg_queue_depth.value = 0.0
+            self._avg_latency_ms.value = 0.0
+            self._avg_queue_latency_ms.value = 0.0
 
     @property
     def jobs_processed(self) -> int: return self._jobs_processed.value
@@ -127,18 +139,21 @@ class WorkerPoolMetrics:
 
     def record_queue_depth(self, depth: int) -> None:
         """Update queue depth average using bias-corrected EMA."""
-        # Non-blocking acquire prevents deadlocks during signal re-entrancy.
         if self._lock.acquire(blocking=False):
             try:
-                # Access .value directly since we already hold the outer lock.
-                # Avoid nested .get_lock() calls to prevent potential deadlocks.
-                self._queue_depth_samples.value += 1
-                n = self._queue_depth_samples.value
+                # Atomically update sample count.
+                with self._queue_depth_samples.get_lock():
+                    self._queue_depth_samples.value += 1
+                    n = self._queue_depth_samples.value
                 
-                if n <= self._warmup_window:
-                    self._avg_queue_depth.value = (self._avg_queue_depth.value * (n - 1) + depth) / n
-                else:
-                    self._avg_queue_depth.value = 0.9 * self._avg_queue_depth.value + 0.1 * depth
+                # Perform floating point calculation locally then update atomically.
+                with self._avg_queue_depth.get_lock():
+                    curr = self._avg_queue_depth.value
+                    if n <= self._warmup_window:
+                        new_avg = (curr * (n - 1) + depth) / n
+                    else:
+                        new_avg = 0.9 * curr + 0.1 * depth
+                    self._avg_queue_depth.value = new_avg
             finally:
                 self._lock.release()
             
@@ -150,13 +165,17 @@ class WorkerPoolMetrics:
         latency_ms = latency * 1000.0
         if self._lock.acquire(blocking=False):
             try:
-                self._latency_samples.value += 1
-                n = self._latency_samples.value
+                with self._latency_samples.get_lock():
+                    self._latency_samples.value += 1
+                    n = self._latency_samples.value
                 
-                if n <= self._warmup_window:
-                    self._avg_latency_ms.value = (self._avg_latency_ms.value * (n - 1) + latency_ms) / n
-                else:
-                    self._avg_latency_ms.value = 0.9 * self._avg_latency_ms.value + 0.1 * latency_ms
+                with self._avg_latency_ms.get_lock():
+                    curr = self._avg_latency_ms.value
+                    if n <= self._warmup_window:
+                        new_avg = (curr * (n - 1) + latency_ms) / n
+                    else:
+                        new_avg = 0.9 * curr + 0.1 * latency_ms
+                    self._avg_latency_ms.value = new_avg
             finally:
                 self._lock.release()
 
@@ -165,13 +184,17 @@ class WorkerPoolMetrics:
         latency_ms = latency * 1000.0
         if self._lock.acquire(blocking=False):
             try:
-                self._queue_latency_samples.value += 1
-                n = self._queue_latency_samples.value
+                with self._queue_latency_samples.get_lock():
+                    self._queue_latency_samples.value += 1
+                    n = self._queue_latency_samples.value
                 
-                if n <= self._warmup_window:
-                    self._avg_queue_latency_ms.value = (self._avg_queue_latency_ms.value * (n - 1) + latency_ms) / n
-                else:
-                    self._avg_queue_latency_ms.value = 0.9 * self._avg_queue_latency_ms.value + 0.1 * latency_ms
+                with self._avg_queue_latency_ms.get_lock():
+                    curr = self._avg_queue_latency_ms.value
+                    if n <= self._warmup_window:
+                        new_avg = (curr * (n - 1) + latency_ms) / n
+                    else:
+                        new_avg = 0.9 * curr + 0.1 * latency_ms
+                    self._avg_queue_latency_ms.value = new_avg
             finally:
                 self._lock.release()
 
@@ -192,7 +215,6 @@ class WorkerPoolMetrics:
     
     def update_resources(self, memory_mb: float, cpu_percent: float) -> None:
         """Update resource snapshots and track peak CPU bursts."""
-        # Using billiard locks for atomicity
         with self._memory_mb.get_lock():
             self._memory_mb.value = memory_mb
         with self._cpu_percent.get_lock():
