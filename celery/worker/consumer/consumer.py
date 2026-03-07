@@ -165,7 +165,6 @@ class Consumer:
     class Blueprint(bootsteps.Blueprint):
         """Consumer blueprint."""
 
-        name = 'Consumer'
         default_steps = [
             'celery.worker.consumer.connection:Connection',
             'celery.worker.consumer.mingle:Mingle',
@@ -177,6 +176,10 @@ class Consumer:
             'celery.worker.consumer.delayed_delivery:DelayedDelivery',
             'celery.worker.consumer.consumer:Evloop',
             'celery.worker.consumer.agent:Agent',
+            'celery.worker.bootsteps.telemetry:TelemetryBootstep',
+        ]
+
+            'celery.worker.bootsteps.telemetry:TelemetryBootstep',
         ]
 
         def shutdown(self, parent):
