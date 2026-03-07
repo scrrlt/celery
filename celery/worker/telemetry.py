@@ -44,7 +44,7 @@ except ImportError:
 
 OTEL_AVAILABLE: Final[bool] = _OTEL_AVAILABLE
 
-@dataclass(slots=True)
+@dataclass
 class WorkerPoolMetrics:
     """Aggregator for worker pool performance metrics.
     
