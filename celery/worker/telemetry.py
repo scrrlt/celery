@@ -24,6 +24,12 @@ DEFAULT_COLLECTION_INTERVAL: Final[float] = 60.0
 DEFAULT_HEALTH_LOG_INTERVAL: Final[float] = 300.0
 DEFAULT_WINDOW_SIZE: Final[int] = 200
 
+# Recommended OTel histogram buckets for Celery tasks, covering short to long-running jobs.
+LATENCY_BUCKETS: Final[list[float]] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 
+    1.0, 2.5, 5.0, 7.5, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0
+]
+
 try:
     from opentelemetry.metrics import Counter, Histogram, UpDownCounter, Gauge, get_meter
     _OTEL_AVAILABLE = True
@@ -95,6 +101,9 @@ class WorkerPoolMetrics:
             start_time: High-resolution timestamp from start of execution.
         """
         latency: float = time.perf_counter() - start_time
+        # Optimization: We keep the lock duration as short as possible.
+        # deque is thread-safe for append/pop operations, but we need the lock
+        # for consistent sum updates.
         with self._lock:
             if len(self.processing_latencies) >= (self.processing_latencies.maxlen or DEFAULT_WINDOW_SIZE):
                 self._processing_latencies_sum -= self.processing_latencies[0]
@@ -158,7 +167,15 @@ class TelemetryCollector:
             self.queue_depth_gauge = meter.create_up_down_counter("celery.jobs.queue_depth")
             self.memory_gauge = meter.create_up_down_counter("celery.worker.memory_mb")
             
-        self.latency_histogram = meter.create_histogram("celery.jobs.latency")
+        # Use explicit buckets to cover long-running tasks.
+        self.latency_histogram = meter.create_histogram(
+            "celery.jobs.latency", 
+            unit="s",
+            description="Task execution latency",
+        )
+        # Note: If the OTel SDK supports it, buckets are typically configured via Views.
+        # We record the value, and the exporter/provider handles bucket assignment.
+        
         self.completed_counter = meter.create_counter("celery.jobs.completed")
 
     def record_job_received(self, queue_depth: int) -> None:

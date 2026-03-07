@@ -47,7 +47,7 @@ def _add_health_tasks(app: Celery) -> None:
     These tasks enable tools to query worker health via the message broker.
     """
     
-    @app.task(name='celery.internal.telemetry.health_summary', bind=True)
+    @app.task(name='celery.internal.telemetry.health_summary', bind=True, ignore_result=True)
     def get_health_summary(self) -> dict[str, Any]:
         """Returns a snapshot of worker performance and queue stats.
         
@@ -69,7 +69,7 @@ def _add_health_tasks(app: Celery) -> None:
         
         return {"status": "active", **summary}
 
-    @app.task(name='celery.health.ping')
+    @app.task(name='celery.health.ping', ignore_result=True)
     def ping() -> str:
         """Lightweight responsiveness check.
         
