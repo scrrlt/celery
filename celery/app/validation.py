@@ -119,7 +119,7 @@ def validate_range(min_val: float | None = None, max_val: float | None = None) -
 
 @functools.lru_cache(maxsize=128)
 def _compile_regex(pattern: str) -> re.Pattern:
-    """Cache compiled regex objects."""
+    # Mitigate O(N) regex compilation overhead in high-throughput validation paths.
     return re.compile(pattern)
 
 def validate_regex(pattern: str) -> ValidatorFunc:

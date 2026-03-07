@@ -63,7 +63,6 @@ class BoundedDict(OrderedDict):
     def items_snapshot(self) -> Dict[Any, Any]:
         """Return a thread-safe copy of current items."""
         with self._lock:
-            # Traverse once to minimize lock contention.
             return dict(self.items())
 
 class TelemetryBootstep(bootsteps.Step):
@@ -110,7 +109,7 @@ class TelemetryBootstep(bootsteps.Step):
         self._start_http_server()
 
     def _start_http_server(self) -> None:
-        """Start out-of-band HTTP server with port hunting and timeouts."""
+        """Start out-of-band HTTP server with port hunting and client timeouts."""
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import json
 
@@ -128,14 +127,18 @@ class TelemetryBootstep(bootsteps.Step):
                     self.end_headers()
             def log_message(self, format: str, *args: Any) -> None: pass
 
+        class HardenedHTTPServer(ThreadingHTTPServer):
+            def finish_request(self, request: Any, client_address: Any) -> None:
+                # Protect against Slowloris by setting timeout on the client socket.
+                request.settimeout(5.0)
+                super().finish_request(request, client_address)
+
         for port in range(self.base_port, self.base_port + 10):
             try:
-                self._http_server = ThreadingHTTPServer(('0.0.0.0', port), MetricsHandler, bind_and_activate=False)
+                self._http_server = HardenedHTTPServer(('0.0.0.0', port), MetricsHandler, bind_and_activate=False)
                 self._http_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self._http_server.server_bind()
                 self._http_server.server_activate()
-                
-                self._http_server.socket.settimeout(5.0)
                 self._http_server.daemon_threads = True
                 
                 self._http_thread = threading.Thread(
@@ -233,12 +236,10 @@ class TelemetryBootstep(bootsteps.Step):
             with contextlib.suppress(AttributeError):
                 delattr(request, '_celery_telemetry_rx')
 
-    def _on_task_cleanup(self, task_id: str | None = None, request: Any = None, **kwargs: Any) -> None:
+    def _on_task_cleanup(self, request: Optional[Any] = None, task_id: Optional[str] = None, **kwargs: Any) -> None:
         """Purge metadata for aborted tasks."""
         if task_id:
             self._task_start_times.pop(task_id, None)
-        # request can be passed from signal or extracted from task.
-        request = request or (getattr(kwargs.get('task'), 'request', None) if kwargs.get('task') else None)
         if request:
             with contextlib.suppress(AttributeError):
                 delattr(request, '_celery_telemetry_rx')

@@ -66,10 +66,9 @@ except ImportError:
 OTEL_AVAILABLE: Final[bool] = _OTEL_AVAILABLE
 
 class WorkerPoolMetrics:
-    """Maintain O(1) running averages via EMA to prevent memory growth.
+    """Use shared memory (billiard) for cross-process metric aggregation.
     
-    Adopts shared memory via billiard.Value for aggregate visibility 
-    across prefork child processes.
+    Maintain O(1) running averages via EMA to prevent memory growth.
     """
     
     def __init__(

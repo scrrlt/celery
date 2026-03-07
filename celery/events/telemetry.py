@@ -70,16 +70,18 @@ class EventTelemetry:
         self._worker_thread.start()
 
     def __getstate__(self) -> dict[str, Any]:
-        """Exclude lock and thread from serialization."""
+        """Exclude lock, thread, and queue from serialization."""
         state = self.__dict__.copy()
         state.pop('_lock', None)
         state.pop('_worker_thread', None)
+        state.pop('_queue', None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restore state and restart processor after deserialization."""
         self.__dict__.update(state)
         self._lock = threading.RLock()
+        self._queue = queue.Queue(maxsize=1000)
         if self.enabled:
             self._start_processor()
 
