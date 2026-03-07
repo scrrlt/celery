@@ -19,16 +19,17 @@ class TestWorkerPoolMetrics:
     
     def create_metrics(self):
         """Helper to initialize metrics with shared memory."""
+        # Use 'L' (unsigned long) for counters to match production implementation.
         return WorkerPoolMetrics(
-            jobs_processed=multiprocessing.Value('i', 0),
-            jobs_failed=multiprocessing.Value('i', 0),
-            jobs_retried=multiprocessing.Value('i', 0),
+            jobs_processed=multiprocessing.Value('L', 0),
+            jobs_failed=multiprocessing.Value('L', 0),
+            jobs_retried=multiprocessing.Value('L', 0),
             avg_queue_depth=multiprocessing.Value('d', 0.0),
             avg_latency_ms=multiprocessing.Value('d', 0.0),
             avg_queue_latency_ms=multiprocessing.Value('d', 0.0),
-            queue_depth_samples=multiprocessing.Value('i', 0),
-            latency_samples=multiprocessing.Value('i', 0),
-            queue_latency_samples=multiprocessing.Value('i', 0),
+            queue_depth_samples=multiprocessing.Value('L', 0),
+            latency_samples=multiprocessing.Value('L', 0),
+            queue_latency_samples=multiprocessing.Value('L', 0),
             memory_mb=multiprocessing.Value('d', 0.0),
             cpu_percent=multiprocessing.Value('d', 0.0),
             max_cpu_percent=multiprocessing.Value('d', 0.0),
@@ -59,7 +60,7 @@ class TestWorkerPoolMetrics:
         metrics.record_latency(0.1) # 100ms
         assert metrics.avg_latency_ms == 100.0
         
-        # Second latency observation
+        # Second latency observation uses EMA: 0.9 * 100 + 0.1 * 200 = 110.0
         metrics.record_latency(0.2) # 200ms
         assert metrics.avg_latency_ms == 110.0
 

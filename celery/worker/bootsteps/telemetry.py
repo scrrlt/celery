@@ -71,6 +71,11 @@ class TelemetryBootstep(bootsteps.Step):
         init_telemetry(enabled=True)
         collector = get_collector()
         
+        # Single-process pool check (e.g., -P solo, -P threads).
+        # Since worker_process_init won't fire, we initialize OTel immediately.
+        if getattr(consumer.pool, 'is_single_process', False):
+            collector.setup_otel()
+        
         self._connect_signals()
         
         # Background monitor thread.
