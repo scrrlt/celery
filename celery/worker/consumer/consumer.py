@@ -179,9 +179,6 @@ class Consumer:
             'celery.worker.bootsteps.telemetry:TelemetryBootstep',
         ]
 
-            'celery.worker.bootsteps.telemetry:TelemetryBootstep',
-        ]
-
         def shutdown(self, parent):
             self.send_all(parent, 'shutdown')
 
