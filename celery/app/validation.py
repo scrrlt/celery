@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# PEP 613: TypeAlias for backward compatibility with Python < 3.12
+# PEP 613: TypeAlias for backward compatibility.
 ValidatorFunc: TypeAlias = Callable[[Any, str], Any]
 
 class ValidationError(ImproperlyConfigured):
@@ -65,28 +65,39 @@ class OptionSchema:
             return self.default
 
         if not isinstance(value, self.expected_type):
-            try:
-                types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
-                
-                if int in types:
-                    value = int(value)
-                elif float in types:
-                    value = float(value)
-                elif bool in types and isinstance(value, str):
-                    # Strict boolean coercion to prevent silent misconfiguration.
-                    normalized = value.lower()
-                    if normalized in ("true", "1", "yes", "on"):
-                        value = True
-                    elif normalized in ("false", "0", "no", "off"):
-                        value = False
+            types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
+            
+            # Iterative coercion ensures all allowed types are checked.
+            success = False
+            for target_type in types:
+                try:
+                    if target_type is int:
+                        value = int(value)
+                    elif target_type is float:
+                        value = float(value)
+                    elif target_type is bool and isinstance(value, str):
+                        # Strict boolean mapping to prevent silent typos.
+                        norm = value.lower()
+                        if norm in ("true", "1", "yes", "on"):
+                            value = True
+                        elif norm in ("false", "0", "no", "off"):
+                            value = False
+                        else:
+                            continue 
                     else:
-                        raise ValueError(f"Invalid boolean string: {value!r}")
-            except (ValueError, TypeError) as exc:
+                        continue 
+                    
+                    success = True
+                    break
+                except (ValueError, TypeError):
+                    continue
+            
+            if not success:
                 raise ValidationError(
                     f"Option {self.name!r} must be of type {self.expected_type!r}",
                     option=self.name,
                     value=value
-                ) from exc
+                )
 
         if self.validator:
             return self.validator(value, self.name)

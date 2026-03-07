@@ -104,12 +104,12 @@ class WorkerPoolMetrics:
         
         self.alert_queue_depth_threshold = 1000
         self.alert_latency_threshold_ms = 5000.0
-        # Larger warm-up window to ensure EMA stability.
-        self._warmup_window = 100
+        
+        # EMA alpha coefficient (0.1 corresponds to ~10 observation window).
+        self._alpha = 0.1
 
     def shutdown(self) -> None:
         """Release or zero shared memory handles."""
-        # billiard.Value doesn't require explicit close, but we zero them.
         with self._lock:
             self._jobs_processed.value = 0
             self._jobs_failed.value = 0
@@ -137,23 +137,27 @@ class WorkerPoolMetrics:
     @property
     def max_cpu_percent(self) -> float: return self._max_cpu_percent.value
 
+    def _update_ema(self, shared_avg: Value, shared_count: Value, new_val: float) -> None:
+        """Update shared average using bias-corrected EMA to ensure smooth warm-up."""
+        with shared_count.get_lock():
+            shared_count.value += 1
+            t = shared_count.value
+            
+        with shared_avg.get_lock():
+            # Standard EMA: v_t = beta * v_t-1 + (1 - beta) * theta_t
+            beta = 1.0 - self._alpha
+            shared_avg.value = (beta * shared_avg.value) + (self._alpha * new_val)
+            
+            # Note: The property access for the summary already returns the 
+            # bias-corrected value implicitly if we were to apply it here,
+            # but for simplicity in distributed memory, we maintain the 
+            # running total and correct for bias during the first few samples.
+
     def record_queue_depth(self, depth: int) -> None:
-        """Update queue depth average using bias-corrected EMA."""
+        """Update queue depth average using EMA."""
         if self._lock.acquire(blocking=False):
             try:
-                # Atomically update sample count.
-                with self._queue_depth_samples.get_lock():
-                    self._queue_depth_samples.value += 1
-                    n = self._queue_depth_samples.value
-                
-                # Perform floating point calculation locally then update atomically.
-                with self._avg_queue_depth.get_lock():
-                    curr = self._avg_queue_depth.value
-                    if n <= self._warmup_window:
-                        new_avg = (curr * (n - 1) + depth) / n
-                    else:
-                        new_avg = 0.9 * curr + 0.1 * depth
-                    self._avg_queue_depth.value = new_avg
+                self._update_ema(self._avg_queue_depth, self._queue_depth_samples, float(depth))
             finally:
                 self._lock.release()
             
@@ -161,40 +165,18 @@ class WorkerPoolMetrics:
             logger.warning("Worker queue pressure detected: %d tasks", depth)
 
     def record_latency(self, latency: float) -> None:
-        """Update execution latency average using bias-corrected EMA."""
-        latency_ms = latency * 1000.0
+        """Update execution latency average using EMA."""
         if self._lock.acquire(blocking=False):
             try:
-                with self._latency_samples.get_lock():
-                    self._latency_samples.value += 1
-                    n = self._latency_samples.value
-                
-                with self._avg_latency_ms.get_lock():
-                    curr = self._avg_latency_ms.value
-                    if n <= self._warmup_window:
-                        new_avg = (curr * (n - 1) + latency_ms) / n
-                    else:
-                        new_avg = 0.9 * curr + 0.1 * latency_ms
-                    self._avg_latency_ms.value = new_avg
+                self._update_ema(self._avg_latency_ms, self._latency_samples, latency * 1000.0)
             finally:
                 self._lock.release()
 
     def record_queue_latency(self, latency: float) -> None:
-        """Update queue wait time average using bias-corrected EMA."""
-        latency_ms = latency * 1000.0
+        """Update queue wait time average using EMA."""
         if self._lock.acquire(blocking=False):
             try:
-                with self._queue_latency_samples.get_lock():
-                    self._queue_latency_samples.value += 1
-                    n = self._queue_latency_samples.value
-                
-                with self._avg_queue_latency_ms.get_lock():
-                    curr = self._avg_queue_latency_ms.value
-                    if n <= self._warmup_window:
-                        new_avg = (curr * (n - 1) + latency_ms) / n
-                    else:
-                        new_avg = 0.9 * curr + 0.1 * latency_ms
-                    self._avg_queue_latency_ms.value = new_avg
+                self._update_ema(self._avg_queue_latency_ms, self._queue_latency_samples, latency * 1000.0)
             finally:
                 self._lock.release()
 
@@ -214,7 +196,7 @@ class WorkerPoolMetrics:
             self._jobs_retried.value += 1
     
     def update_resources(self, memory_mb: float, cpu_percent: float) -> None:
-        """Update resource snapshots and track peak CPU bursts."""
+        """Update resource snapshots and peak CPU bursts."""
         with self._memory_mb.get_lock():
             self._memory_mb.value = memory_mb
         with self._cpu_percent.get_lock():
@@ -224,7 +206,7 @@ class WorkerPoolMetrics:
                 self._max_cpu_percent.value = cpu_percent
 
     def reset_max_cpu(self) -> None:
-        """Reset peak CPU tracker for new measurement window."""
+        """Reset peak CPU tracker."""
         with self._max_cpu_percent.get_lock():
             self._max_cpu_percent.value = 0.0
 
@@ -238,7 +220,6 @@ def _get_shared_metrics() -> WorkerPoolMetrics:
     global _METRIC_STORE
     with _METRIC_STORE_LOCK:
         if not _METRIC_STORE:
-            # Use 'L' (unsigned long) for counters and 'd' (double) for averages.
             _METRIC_STORE['metrics'] = WorkerPoolMetrics(
                 jobs_processed=Value('L', 0),
                 jobs_failed=Value('L', 0),
@@ -379,10 +360,17 @@ class TelemetryCollector:
         """Return snapshot of current metrics."""
         if not self.enabled or not self.metrics:
             return None
+            
+        # Standard EMA Bias Correction: v_t / (1 - beta^t)
+        def _correct(val: float, count: int) -> float:
+            if count == 0: return 0.0
+            beta_t = (1.0 - self.metrics._alpha) ** count
+            return val / (1.0 - beta_t)
+
         return {
-            "avg_queue_depth": self.metrics.avg_queue_depth,
-            "avg_latency_ms": self.metrics.avg_latency_ms,
-            "avg_queue_latency_ms": self.metrics.avg_queue_latency_ms,
+            "avg_queue_depth": _correct(self.metrics.avg_queue_depth, self.metrics._queue_depth_samples.value),
+            "avg_latency_ms": _correct(self.metrics.avg_latency_ms, self.metrics._latency_samples.value),
+            "avg_queue_latency_ms": _correct(self.metrics.avg_queue_latency_ms, self.metrics._queue_latency_samples.value),
             "jobs_processed": self.metrics.jobs_processed,
             "jobs_failed": self.metrics.jobs_failed,
             "jobs_retried": self.metrics.jobs_retried,

@@ -63,7 +63,6 @@ class BoundedDict(OrderedDict):
     def items_snapshot(self) -> Dict[Any, Any]:
         """Return a thread-safe copy of current items."""
         with self._lock:
-            # OrderedDict.copy() is highly optimized in CPython.
             return dict(self.copy())
 
 class TelemetryBootstep(bootsteps.Step):
@@ -197,7 +196,6 @@ class TelemetryBootstep(bootsteps.Step):
         """
         if request:
             try:
-                # Use internal prefix to avoid collision and detect initial arrival.
                 if not hasattr(request, '_celery_telemetry_rx'):
                     setattr(request, '_celery_telemetry_rx', time.perf_counter())
             except (AttributeError, TypeError):
@@ -217,7 +215,7 @@ class TelemetryBootstep(bootsteps.Step):
                 logger.debug("Task %s queue latency: %.4fs", task_id, queue_latency)
 
     def _on_task_postrun(self, task_id: str | None = None, task: Any = None, state: str | None = None, **kwargs: Any) -> None:
-        """Update completion metrics."""
+        """Update completion metrics and clear metadata."""
         start_time = getattr(task, '_telemetry_start_time', 0.0) if task else 0.0
         
         status = 'success'
@@ -227,11 +225,20 @@ class TelemetryBootstep(bootsteps.Step):
             status = 'failure'
             
         get_collector().record_job_completed(start_time, status=status)
+        
+        # Purge request metadata to prevent leak in pooled objects.
+        request = getattr(task, 'request', None)
+        if request:
+            with contextlib.suppress(AttributeError):
+                delattr(request, '_celery_telemetry_rx')
 
-    def _on_task_cleanup(self, task_id: str | None = None, **kwargs: Any) -> None:
+    def _on_task_cleanup(self, task_id: str | None = None, request: Any = None, **kwargs: Any) -> None:
         """Purge metadata for aborted tasks."""
         if task_id:
             self._task_start_times.pop(task_id, None)
+        if request:
+            with contextlib.suppress(AttributeError):
+                delattr(request, '_celery_telemetry_rx')
 
     def _on_worker_shutdown(self, **kwargs: Any) -> None:
         """Log worker termination."""
@@ -241,7 +248,6 @@ class TelemetryBootstep(bootsteps.Step):
         """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
-            # Prime CPU measurement utilization since last call.
             proc.cpu_percent(interval=None)
             
         sample_interval = max(1.0, self.interval / 10.0)
@@ -256,7 +262,6 @@ class TelemetryBootstep(bootsteps.Step):
                     cpu = proc.cpu_percent(interval=None)
                     collector.record_resource_usage(memory_mb=mem, cpu_percent=cpu)
                     
-                    # Log heartbeat every 10 samples (matching reporting interval).
                     if sample_count % 10 == 0:
                         logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
                     consecutive_errors = 0 
