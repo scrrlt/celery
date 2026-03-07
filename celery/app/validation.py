@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Callable, Final, TYPE_CHECKING
+from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable
 
 from celery.exceptions import ImproperlyConfigured
 from celery.utils.log import get_logger
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# PEP 695: Python 3.12 Type Aliases
+# PEP 695: Python 3.12 Type Aliases - Publicly exported
 type ValidatorFunc = Callable[[Any, str], Any]
 
 class ValidationError(ImproperlyConfigured):
@@ -89,19 +89,36 @@ def validate_range(min_val: float | None = None, max_val: float | None = None) -
     def _check(value: Any, name: str) -> Any:
         if min_val is not None and value < min_val:
             raise ValidationError(f"{name!r} is below minimum {min_val}", name, value)
-        if min_val is not None and value < min_val: # Intentional check for logic
-             pass
         if max_val is not None and value > max_val:
             raise ValidationError(f"{name!r} exceeds maximum {max_val}", name, value)
         return value
     return _check
 
 def validate_regex(pattern: str) -> ValidatorFunc:
-    """Factory for string regex validators."""
+    """Factory for string regex validators.
+    
+    Handles both single strings and sequences (e.g., list of URLs).
+    """
     regex = re.compile(pattern)
     def _check(value: Any, name: str) -> Any:
-        if not regex.match(str(value)):
-            raise ValidationError(f"{name!r} does not match required format", name, value)
+        # Support for list/tuple values (like multiple broker URLs)
+        values_to_check: Iterable[Any] = [value] if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [value])
+        
+        for val in values_to_check:
+            if not regex.match(str(val)):
+                raise ValidationError(f"{name!r} element {val!r} does not match required format", name, value)
+        return value
+    return _check
+
+def validate_choice(choices: Container) -> ValidatorFunc:
+    """Factory for choice-based string validators."""
+    def _check(value: Any, name: str) -> Any:
+        if value not in choices:
+            raise ValidationError(
+                f"{name!r} must be one of {choices!r}",
+                option=name,
+                value=value
+            )
         return value
     return _check
 
@@ -109,7 +126,7 @@ def validate_regex(pattern: str) -> ValidatorFunc:
 CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
     'broker_url': OptionSchema('broker_url', (str, list), validator=validate_regex(r'^(redis|rediss|amqp|amqps|sqs|memory|sentinel)')),
     'worker_concurrency': OptionSchema('worker_concurrency', int, default=4, validator=validate_range(1, 1000)),
-    'task_serializer': OptionSchema('task_serializer', str, default='json'),
+    'task_serializer': OptionSchema('task_serializer', str, default='json', validator=validate_choice({'json', 'pickle', 'yaml', 'msgpack'})),
     'result_backend': OptionSchema('result_backend', str),
     'broker_connection_timeout': OptionSchema('broker_connection_timeout', (int, float), default=4.0),
     'worker_prefetch_multiplier': OptionSchema('worker_prefetch_multiplier', int, default=4, validator=validate_range(0)),
@@ -143,19 +160,3 @@ class ConfigurationValidator:
                     logger.error("Configuration error: %s", exc)
                     
         return validated
-
-def setup_app_validation(app: Celery) -> None:
-    """Integrates configuration validation into the Celery app lifecycle.
-    
-    This performs an initial audit of the application state.
-    """
-    validator = ConfigurationValidator()
-    
-    # We perform an initial audit of the existing configuration.
-    try:
-        validated = validator.validate(dict(app.conf))
-        app.conf.update(validated)
-    except Exception as exc:
-        logger.error("Early configuration validation failed: %s", exc)
-    
-    logger.info("Application configuration validation active")

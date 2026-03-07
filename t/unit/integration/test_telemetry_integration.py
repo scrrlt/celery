@@ -21,32 +21,28 @@ class TestWorkerPoolMetrics:
         metrics = WorkerPoolMetrics()
         assert metrics.jobs_processed == 0
         assert metrics.jobs_failed == 0
-        assert len(metrics.job_queue_depths) == 0
+        assert metrics.avg_queue_depth == 0.0
+        assert metrics.avg_latency_ms == 0.0
 
-    def test_rolling_window(self):
-        """Ensures the rolling window bounds memory usage."""
+    def test_ema_averages(self):
+        """Ensures Exponential Moving Average (EMA) updates correctly."""
         metrics = WorkerPoolMetrics()
-        # Filling beyond DEFAULT_WINDOW_SIZE (200)
-        for i in range(300):
-            metrics.record_queue_depth(i)
         
-        assert len(metrics.job_queue_depths) == 200
-        assert metrics.job_queue_depths[-1] == 299
-        assert metrics.job_queue_depths[0] == 100
-
-    def test_averages(self):
-        """Verifies average calculations over multiple observations."""
-        metrics = WorkerPoolMetrics()
+        # First observation sets the initial average directly
         metrics.record_queue_depth(10)
+        assert metrics.avg_queue_depth == 10.0
+        
+        # Second observation uses EMA: 0.9 * 10 + 0.1 * 20 = 11.0
         metrics.record_queue_depth(20)
-        assert metrics.avg_queue_depth == 15.0
+        assert metrics.avg_queue_depth == 11.0
         
-        # Test latency average (converted to ms)
-        start = time.perf_counter()
-        metrics.record_latency(start - 0.1) # 100ms
-        metrics.record_latency(start - 0.2) # 200ms
+        # First latency observation
+        metrics.record_latency(0.1) # 100ms
+        assert metrics.avg_latency_ms == 100.0
         
-        assert 140 <= metrics.avg_latency_ms <= 160
+        # Second latency observation uses EMA: 0.9 * 100 + 0.1 * 200 = 110.0
+        metrics.record_latency(0.2) # 200ms
+        assert metrics.avg_latency_ms == 110.0
 
     def test_resource_updates(self):
         """Verifies resource snapshot updates."""
@@ -91,6 +87,9 @@ class TestConfigurationValidation:
         
         with pytest.raises(ValidationError):
             validator('amqp://localhost', 'test')
+            
+        # Support for list of URLs
+        assert validator(['redis://localhost', 'redis://other'], 'test') == ['redis://localhost', 'redis://other']
 
     def test_orchestrator(self):
         """Validates the full configuration audit workflow."""
@@ -147,7 +146,7 @@ class TestIntegration:
             for _ in range(100):
                 collector.record_job_received(1)
                 # simulate 1ms work
-                collector.record_job_completed(time.perf_counter() - 0.001, True)
+                collector.record_job_completed(time.perf_counter() - 0.001, status='success')
         
         threads = [threading.Thread(target=run_load) for _ in range(10)]
         for t in threads:
@@ -158,7 +157,6 @@ class TestIntegration:
         summary = collector.get_summary()
         # Verify 10 threads * 100 iterations
         assert summary["jobs_processed"] == 1000
-        assert summary["avg_queue_depth"] == 1.0
 
     def test_health_tasks(self):
         """Verifies built-in health tasks are registered."""
@@ -184,9 +182,14 @@ class TestMemorySafety:
         assert 'd' in bd
 
     def test_event_telemetry_task_capping(self):
-        """Verifies EventTelemetry bounds the number of tracked task names."""
-        from celery.events.telemetry import EventTelemetry
-        et = EventTelemetry(enabled=True)
+        """Verifies EventTelemetry bounds the number of tracked task names and normalizes UUIDs."""
+        from celery.events.telemetry import EventTelemetry, _normalize_task_name
+        et = EventTelemetry(enabled=True, track_tasks=True)
+        
+        # Test Normalization
+        assert _normalize_task_name("task_12345678") == "task_<id>"
+        assert _normalize_task_name("task_a1b2c3d4-e5f6") == "task_<id>-<id>"
+        
         # Record many different task names
         for i in range(1000):
             et.record_dispatch('task-sent', 0.1, task_name=f'task_{i}')

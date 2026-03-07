@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from celery.worker.telemetry import init_telemetry, get_collector
-from celery.app.validation import setup_app_validation
+from celery.app.validation import ConfigurationValidator
 
 if TYPE_CHECKING:
     from celery.app.base import Celery
@@ -35,9 +35,18 @@ def enable_production_telemetry(
         logger.info("Worker pool telemetry active")
 
     if validation_enabled:
-        setup_app_validation(app)
-        logger.info("Configuration validation active")
-    
+        # Delay validation until after the application configuration is finalized.
+        # This prevents issues where early validation reads un-finalized PendingConfiguration objects.
+        @app.on_after_finalize.connect(weak=False)
+        def _validate_config(sender: Celery, **kwargs: Any) -> None:
+            validator = ConfigurationValidator()
+            try:
+                validated = validator.validate(dict(sender.conf))
+                sender.conf.update(validated)
+                logger.info("Application configuration validation active")
+            except Exception as exc:
+                logger.error("Configuration validation failed during finalization: %s", exc)
+
     # Register internal tasks used for fleet-wide health aggregation.
     _add_health_tasks(app)
 
@@ -64,6 +73,7 @@ def _add_health_tasks(app: Celery) -> None:
                 "avg_latency_ms": 0.0,
                 "jobs_processed": 0,
                 "jobs_failed": 0,
+                "jobs_retried": 0,
                 "resource_usage": {"memory_mb": 0.0, "cpu_percent": 0.0}
             }
         
