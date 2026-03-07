@@ -54,9 +54,9 @@ class OptionSchema:
         
         # Use standard library introspection to safely unwrap Unions/PEP 604 types.
         origin = get_origin(expected_type)
-        if origin is Union or (hasattr(re, 'Pattern') and origin is getattr(Union, '__class__', None)): # Fallback for old versions
+        if origin is Union or (hasattr(re, 'Pattern') and origin is getattr(Union, '__class__', None)):
             self.expected_type = get_args(expected_type)
-        elif hasattr(expected_type, "__args__"): # PEP 604 (int | float) on some versions
+        elif hasattr(expected_type, "__args__"):
             self.expected_type = expected_type.__args__
         else:
             self.expected_type = expected_type
@@ -92,7 +92,7 @@ class OptionSchema:
                         else:
                             continue
                     else:
-                        continue
+                        continue 
                     
                     success = True
                     break
@@ -121,14 +121,10 @@ def validate_range(min_val: float | None = None, max_val: float | None = None) -
         return value
     return _check
 
-@functools.lru_cache(maxsize=128)
-def _compile_regex(pattern: str) -> re.Pattern:
-    # Mitigate O(N) regex compilation overhead in high-throughput validation paths.
-    return re.compile(pattern)
-
 def validate_regex(pattern: str) -> ValidatorFunc:
     """Create a string regex validator."""
-    regex = _compile_regex(pattern)
+    # Pre-compile at factory level to avoid O(N) overhead in validation paths.
+    regex = re.compile(pattern)
     def _check(value: Any, name: str) -> Any:
         values_to_check: Iterable[Any] = [value] if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [value])
         
@@ -161,7 +157,7 @@ CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
 }
 
 class ConfigurationValidator:
-    """Validate application configuration."""
+    """Application configuration validator."""
     
     def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
         self.schema = schema or CELERY_CORE_SCHEMA

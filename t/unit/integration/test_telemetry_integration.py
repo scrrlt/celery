@@ -8,6 +8,12 @@ from typing import Any
 import pytest
 from unittest.mock import Mock, patch
 
+# Handle optional psutil for CI stability.
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 # Use billiard for shared memory tests to match production.
 from billiard import Value, RLock as BilliardRLock
 
@@ -21,7 +27,6 @@ class TestWorkerPoolMetrics:
     
     def create_metrics(self):
         """Helper to initialize metrics with shared memory."""
-        # Use 'L' (unsigned long) for counters to match production.
         return WorkerPoolMetrics(
             jobs_processed=Value('L', 0),
             jobs_failed=Value('L', 0),
@@ -50,19 +55,17 @@ class TestWorkerPoolMetrics:
         """Ensures Exponential Moving Average (EMA) updates correctly."""
         metrics = self.create_metrics()
         
-        # Test smooth warm-up with bias correction
         metrics.record_queue_depth(10)
-        # Internal raw value is 0.1 * 10 = 1.0
-        # Corrected value: 1.0 / (1 - 0.9^1) = 1.0 / 0.1 = 10.0
-        # We access this through the collector's get_summary or manual logic.
-        assert metrics.avg_queue_depth == 1.0 # raw
+        # Internal raw value is 0.1 * 10 = 1.0 (before bias correction in summary)
+        assert metrics.avg_queue_depth == 1.0 
 
     def test_queue_latency(self):
         """Verifies queue latency (time-of-flight) tracking."""
         metrics = self.create_metrics()
         metrics.record_queue_latency(0.05) # 50ms
-        assert metrics.avg_queue_latency_ms == 5.0 # raw EMA result
+        assert metrics.avg_queue_latency_ms == 5.0
 
+    @pytest.mark.skipif(psutil is None, reason="psutil not installed")
     def test_resource_updates(self):
         """Verifies resource snapshot and peak tracking."""
         metrics = self.create_metrics()
@@ -73,7 +76,7 @@ class TestWorkerPoolMetrics:
         
         metrics.update_resources(130.0, 30.0)
         assert metrics.cpu_percent == 30.0
-        assert metrics.max_cpu_percent == 45.2 # Peak preserved
+        assert metrics.max_cpu_percent == 45.2
 
 class TestConfigurationValidation:
     """Validates configuration auditing logic."""
@@ -83,7 +86,6 @@ class TestConfigurationValidation:
         schema = OptionSchema('test', int)
         assert schema.validate("10") == 10
         
-        # Test retry-loop for (int, float)
         multi_schema = OptionSchema('test', (int, float))
         assert multi_schema.validate("1.5") == 1.5
         
@@ -91,7 +93,6 @@ class TestConfigurationValidation:
         assert bool_schema.validate("true") is True
         assert bool_schema.validate("off") is False
         
-        # Test strict boolean failure
         with pytest.raises(ValidationError):
             bool_schema.validate("maybe")
 
@@ -168,7 +169,9 @@ class TestMemorySafety:
         from celery.events.telemetry import EventTelemetry, _normalize_task_name
         et = EventTelemetry(enabled=True, track_tasks=True)
         
+        # Test Normalization (UUID and Int)
         assert _normalize_task_name("task_12345678") == "task_<id>"
+        assert _normalize_task_name("task_a1b2c3d4-e5f6") == "task_<id>-<id>"
         
         for i in range(1000):
             et.record_dispatch('task-sent', 0.1, task_name=f'task_{i}')

@@ -32,11 +32,12 @@ MAX_TASK_NAMES_TRACKED: Final[int] = 500
 MAX_EVENT_TYPES_TRACKED: Final[int] = 100
 MAX_EVENT_TYPES_PER_TASK: Final[int] = 20
 
-# Normalization regex to prevent cardinality explosion.
-_NORMALIZE_ID_REGEX = re.compile(r'[\d\-a-fA-F]{8,}')
+# Normalization regex to prevent cardinality explosion (matches hex, UUIDs, and long integers).
+_NORMALIZE_ID_REGEX = re.compile(r'([\d\-a-fA-F]{8,})')
 
 def _normalize_task_name(name: str) -> str:
     """Strip UUIDs and long identifiers from task names."""
+    # Fast path: skip regex if no numbers are present.
     if not any(c.isdigit() for c in name):
         return name
     return _NORMALIZE_ID_REGEX.sub('<id>', name)

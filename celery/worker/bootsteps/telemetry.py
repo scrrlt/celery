@@ -63,8 +63,8 @@ class BoundedDict(OrderedDict):
     def items_snapshot(self) -> Dict[Any, Any]:
         """Return a thread-safe copy of current items."""
         with self._lock:
-            # Traverse once to minimize lock contention.
-            return dict(self.items())
+            # OrderedDict.copy() is highly optimized in CPython.
+            return dict(self.copy())
 
 class TelemetryBootstep(bootsteps.Step):
     """Integrated telemetry collection via Celery bootstep lifecycle."""
@@ -91,14 +91,17 @@ class TelemetryBootstep(bootsteps.Step):
         if not self.enabled:
             return
         
+        # init_telemetry is also called during config, but we ensure it's active here.
         init_telemetry(enabled=True)
         collector = get_collector()
         
         if getattr(consumer.pool, 'is_single_process', False):
+            # No fork, initialize OTel immediately.
             collector.setup_otel()
         
         self._connect_signals()
         
+        # Background monitor thread.
         self._thread = threading.Thread(
             target=self._monitor_loop,
             args=(consumer, collector),
@@ -129,10 +132,24 @@ class TelemetryBootstep(bootsteps.Step):
             def log_message(self, format: str, *args: Any) -> None: pass
 
         class HardenedHTTPServer(ThreadingHTTPServer):
+            # Limit active threads to prevent DoS starvation.
+            MAX_THREADS = 5
+            _active_threads = 0
+            _thread_lock = threading.Lock()
+
             def finish_request(self, request: Any, client_address: Any) -> None:
-                # Protect against Slowloris by setting timeout on the client socket.
-                request.settimeout(5.0)
-                super().finish_request(request, client_address)
+                with self._thread_lock:
+                    if self._active_threads >= self.MAX_THREADS:
+                        request.close()
+                        return
+                    self._active_threads += 1
+                
+                try:
+                    request.settimeout(5.0)
+                    super().finish_request(request, client_address)
+                finally:
+                    with self._thread_lock:
+                        self._active_threads -= 1
 
         for port in range(self.base_port, self.base_port + 10):
             try:
@@ -140,6 +157,8 @@ class TelemetryBootstep(bootsteps.Step):
                 self._http_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self._http_server.server_bind()
                 self._http_server.server_activate()
+                
+                self._http_server.socket.settimeout(5.0)
                 self._http_server.daemon_threads = True
                 
                 self._http_thread = threading.Thread(
@@ -191,17 +210,16 @@ class TelemetryBootstep(bootsteps.Step):
         self._signal_connections.clear()
 
     def _on_worker_process_init(self, **kwargs: Any) -> None:
-        """Initialize OTel after fork to avoid deadlocks."""
-        get_collector().setup_otel()
+        """Initialize OTel after fork defensively."""
+        try:
+            get_collector().setup_otel()
+        except Exception as exc:
+            logger.error("Failed to initialize OTel in child process: %s", exc)
 
     def _on_task_received(self, sender: Any = None, request: Any = None, **kwargs: Any) -> None:
-        """Update queue depth metrics.
-        
-        Assigns internal timestamp to request to track time-of-flight.
-        """
+        """Update queue depth metrics."""
         if request:
             try:
-                # Use internal prefix to avoid collision and detect initial arrival.
                 if not hasattr(request, '_celery_telemetry_rx'):
                     setattr(request, '_celery_telemetry_rx', time.perf_counter())
             except (AttributeError, TypeError):
@@ -232,7 +250,6 @@ class TelemetryBootstep(bootsteps.Step):
             
         get_collector().record_job_completed(start_time, status=status)
         
-        # Purge request metadata to prevent leak in pooled objects.
         request = getattr(task, 'request', None)
         if request:
             with contextlib.suppress(AttributeError):
@@ -254,7 +271,7 @@ class TelemetryBootstep(bootsteps.Step):
         """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
-            # Prime CPU measurement utilization since last call.
+            # Prime CPU measurement.
             proc.cpu_percent(interval=None)
             
         sample_interval = max(1.0, self.interval / 10.0)

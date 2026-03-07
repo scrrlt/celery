@@ -55,13 +55,9 @@ try:
     from opentelemetry.metrics import Counter, Histogram, UpDownCounter, Gauge, get_meter
     _OTEL_AVAILABLE = True
 except ImportError:
-    try:
-        from opentelemetry.metrics import Counter, Histogram, UpDownCounter, Gauge, get_meter
-        _OTEL_AVAILABLE = True
-    except ImportError:
-        _OTEL_AVAILABLE = False
-        Gauge = None
-        UpDownCounter = None
+    _OTEL_AVAILABLE = False
+    Gauge = None
+    UpDownCounter = None
 
 OTEL_AVAILABLE: Final[bool] = _OTEL_AVAILABLE
 
@@ -85,7 +81,8 @@ class WorkerPoolMetrics:
         memory_mb: Value,
         cpu_percent: Value,
         max_cpu_percent: Value,
-        lock: BilliardRLock
+        lock: BilliardRLock,
+        alpha: float = 0.1
     ) -> None:
         self._jobs_processed = jobs_processed
         self._jobs_failed = jobs_failed
@@ -104,8 +101,8 @@ class WorkerPoolMetrics:
         self.alert_queue_depth_threshold = 1000
         self.alert_latency_threshold_ms = 5000.0
         
-        # EMA alpha coefficient (0.1 corresponds to ~10 observation window).
-        self._alpha = 0.1
+        # Configurable EMA alpha coefficient.
+        self._alpha = alpha
 
     def shutdown(self) -> None:
         """Release or zero shared memory handles."""
