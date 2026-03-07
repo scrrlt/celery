@@ -31,12 +31,15 @@ class BoundedDict(OrderedDict):
         super().__init__(*args, **kwargs)
 
     def __setitem__(self, key: Any, value: Any) -> None:
+        """Add item while enforcing capacity limits."""
         with self._lock:
-            if len(self) >= self.maxlen:
+            # Only evict if adding a NEW key would exceed capacity.
+            if key not in self and len(self) >= self.maxlen:
                 self.popitem(last=False)
             super().__setitem__(key, value)
 
     def pop(self, key: Any, default: Any = None) -> Any:
+        """Safely remove and return an item."""
         with self._lock:
             return super().pop(key, default)
 
@@ -70,6 +73,7 @@ class TelemetryBootstep(bootsteps.Step):
         
         self._connect_signals()
         
+        # Background monitor thread.
         self._thread = threading.Thread(
             target=self._monitor_loop,
             args=(consumer, collector),
@@ -82,7 +86,7 @@ class TelemetryBootstep(bootsteps.Step):
 
     def _start_http_server(self) -> None:
         """Start out-of-band HTTP server with port hunting."""
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import json
 
         class MetricsHandler(BaseHTTPRequestHandler):
@@ -99,11 +103,11 @@ class TelemetryBootstep(bootsteps.Step):
                     self.end_headers()
             def log_message(self, format: str, *args: Any) -> None: pass
 
-        # Try up to 10 consecutive ports to avoid collisions on multi-worker hosts.
+        # Try up to 10 consecutive ports to avoid collisions.
         for port in range(self.base_port, self.base_port + 10):
             try:
-                self._http_server = HTTPServer(('0.0.0.0', port), MetricsHandler)
-                # Ensure HTTP threads don't hang process shutdown.
+                # Use ThreadingHTTPServer to handle concurrent scrapes without blocking.
+                self._http_server = ThreadingHTTPServer(('0.0.0.0', port), MetricsHandler)
                 self._http_server.daemon_threads = True
                 self._http_thread = threading.Thread(
                     target=self._http_server.serve_forever,
@@ -118,7 +122,7 @@ class TelemetryBootstep(bootsteps.Step):
                     logger.error("Failed to start telemetry HTTP server after 10 attempts: %s", e)
 
     def stop(self, consumer: Consumer) -> None:
-        """Ensure clean shutdown of telemetry threads and signal disconnects."""
+        """Ensure clean shutdown of telemetry resources."""
         self._stop_event.set()
         
         if self._http_server:
@@ -137,6 +141,7 @@ class TelemetryBootstep(bootsteps.Step):
         """Subscribe to task lifecycle signals."""
         from celery import signals
         self._signal_connections.extend([
+            signals.worker_process_init.connect(self._on_worker_process_init, weak=False),
             signals.task_received.connect(self._on_task_received, weak=False),
             signals.task_prerun.connect(self._on_task_prerun, weak=False),
             signals.task_postrun.connect(self._on_task_postrun, weak=False),
@@ -152,13 +157,13 @@ class TelemetryBootstep(bootsteps.Step):
                 conn.disconnect()
         self._signal_connections.clear()
 
+    def _on_worker_process_init(self, **kwargs: Any) -> None:
+        """Initialize OTel after fork to avoid deadlocks."""
+        get_collector().setup_otel()
+
     def _on_task_received(self, sender: Any = None, request: Any = None, **kwargs: Any) -> None:
-        """Update queue depth metrics.
-        
-        Attach receipt timestamp to request to track time-of-flight across prefork processes.
-        """
+        """Update queue depth metrics."""
         if request:
-            # Safely attach timing to avoid AttributeError on non-instance request objects.
             try:
                 setattr(request, 'telemetry_received_at', time.perf_counter())
             except (AttributeError, TypeError):
@@ -177,7 +182,7 @@ class TelemetryBootstep(bootsteps.Step):
                 logger.debug("Task %s queue latency: %.4fs", task_id, queue_latency)
 
     def _on_task_postrun(self, task_id: str | None = None, task: Any = None, state: str | None = None, **kwargs: Any) -> None:
-        """Calculate processing latency and update completion metrics."""
+        """Update completion metrics."""
         start_time = getattr(task, '_telemetry_start_time', 0.0) if task else 0.0
         
         status = 'success'
@@ -198,28 +203,25 @@ class TelemetryBootstep(bootsteps.Step):
         get_collector().record_job_received(-1)
 
     def _monitor_loop(self, consumer: Consumer, collector: Any) -> None:
-        """Periodic background task for resource metric collection.
-        
-        Samples CPU at a higher frequency to track bursts within the reporting window.
-        """
+        """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
+            # Prime CPU measurement.
             proc.cpu_percent(interval=None)
             
-        # Reporting window is divided into smaller sampling intervals for peak detection.
         sample_interval = max(1.0, self.interval / 10.0)
+        sample_count = 0
         
         while not self._stop_event.wait(sample_interval):
             try:
                 if proc:
-                    # Update snapshot at every interval.
+                    sample_count += 1
                     mem = proc.memory_info().rss / (1024 * 1024)
                     cpu = proc.cpu_percent(interval=None)
                     collector.record_resource_usage(memory_mb=mem, cpu_percent=cpu)
                     
-                    # Log at the primary collection interval.
-                    if self._stop_event.wait(0): # Check if we should log based on time?
-                        # Simplified: log every few samples.
+                    # Log heartbeat every 10 samples (matching the primary interval).
+                    if sample_count % 10 == 0:
                         logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
                 else:
                     logger.debug("Resource monitoring skip: psutil not available")

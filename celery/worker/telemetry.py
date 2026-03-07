@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 import time
 import multiprocessing
-from dataclasses import dataclass, field
 from typing import Any, Final, TYPE_CHECKING, TypedDict
 
 from celery.utils.log import get_logger
@@ -122,14 +121,20 @@ class WorkerPoolMetrics:
 
     def record_queue_depth(self, depth: int) -> None:
         """Update queue depth average using bias-corrected EMA."""
+        # Note: Non-blocking acquire prevents deadlocks during signal re-entrancy.
         if self._lock.acquire(blocking=False):
             try:
-                self._queue_depth_samples.value += 1
-                n = self._queue_depth_samples.value
-                if n <= self._warmup_window:
-                    self._avg_queue_depth.value = (self._avg_queue_depth.value * (n - 1) + depth) / n
-                else:
-                    self._avg_queue_depth.value = 0.9 * self._avg_queue_depth.value + 0.1 * depth
+                with self._queue_depth_samples.get_lock():
+                    self._queue_depth_samples.value += 1
+                    n = self._queue_depth_samples.value
+                
+                with self._avg_queue_depth.get_lock():
+                    if n <= self._warmup_window:
+                        # Arithmetic mean during warm-up.
+                        self._avg_queue_depth.value = (self._avg_queue_depth.value * (n - 1) + depth) / n
+                    else:
+                        # Switch to EMA for long-term tracking.
+                        self._avg_queue_depth.value = 0.9 * self._avg_queue_depth.value + 0.1 * depth
             finally:
                 self._lock.release()
             
@@ -141,12 +146,15 @@ class WorkerPoolMetrics:
         latency_ms = latency * 1000.0
         if self._lock.acquire(blocking=False):
             try:
-                self._latency_samples.value += 1
-                n = self._latency_samples.value
-                if n <= self._warmup_window:
-                    self._avg_latency_ms.value = (self._avg_latency_ms.value * (n - 1) + latency_ms) / n
-                else:
-                    self._avg_latency_ms.value = 0.9 * self._avg_latency_ms.value + 0.1 * latency_ms
+                with self._latency_samples.get_lock():
+                    self._latency_samples.value += 1
+                    n = self._latency_samples.value
+                
+                with self._avg_latency_ms.get_lock():
+                    if n <= self._warmup_window:
+                        self._avg_latency_ms.value = (self._avg_latency_ms.value * (n - 1) + latency_ms) / n
+                    else:
+                        self._avg_latency_ms.value = 0.9 * self._avg_latency_ms.value + 0.1 * latency_ms
             finally:
                 self._lock.release()
 
@@ -155,30 +163,75 @@ class WorkerPoolMetrics:
         latency_ms = latency * 1000.0
         if self._lock.acquire(blocking=False):
             try:
-                self._queue_latency_samples.value += 1
-                n = self._queue_latency_samples.value
-                if n <= self._warmup_window:
-                    self._avg_queue_latency_ms.value = (self._avg_queue_latency_ms.value * (n - 1) + latency_ms) / n
-                else:
-                    self._avg_queue_latency_ms.value = 0.9 * self._avg_queue_latency_ms.value + 0.1 * latency_ms
+                with self._queue_latency_samples.get_lock():
+                    self._queue_latency_samples.value += 1
+                    n = self._queue_latency_samples.value
+                
+                with self._avg_queue_latency_ms.get_lock():
+                    if n <= self._warmup_window:
+                        self._avg_queue_latency_ms.value = (self._avg_queue_latency_ms.value * (n - 1) + latency_ms) / n
+                    else:
+                        self._avg_queue_latency_ms.value = 0.9 * self._avg_queue_latency_ms.value + 0.1 * latency_ms
             finally:
                 self._lock.release()
 
-    def increment_processed(self) -> None: self._jobs_processed.value += 1
-    def increment_failed(self) -> None: self._jobs_failed.value += 1
-    def increment_retried(self) -> None: self._jobs_retried.value += 1
+    def increment_processed(self) -> None:
+        """Atomically increment processed job count."""
+        with self._jobs_processed.get_lock():
+            self._jobs_processed.value += 1
+            
+    def increment_failed(self) -> None:
+        """Atomically increment failed job count."""
+        with self._jobs_failed.get_lock():
+            self._jobs_failed.value += 1
+            
+    def increment_retried(self) -> None:
+        """Atomically increment retried job count."""
+        with self._jobs_retried.get_lock():
+            self._jobs_retried.value += 1
     
     def update_resources(self, memory_mb: float, cpu_percent: float) -> None:
         """Update resource snapshots and track peak CPU bursts."""
-        self._memory_mb.value = memory_mb
-        self._cpu_percent.value = cpu_percent
-        if cpu_percent > self._max_cpu_percent.value:
-            self._max_cpu_percent.value = cpu_percent
+        with self._memory_mb.get_lock():
+            self._memory_mb.value = memory_mb
+        with self._cpu_percent.get_lock():
+            self._cpu_percent.value = cpu_percent
+        with self._max_cpu_percent.get_lock():
+            if cpu_percent > self._max_cpu_percent.value:
+                self._max_cpu_percent.value = cpu_percent
 
     def reset_max_cpu(self) -> None:
         """Reset peak CPU tracker for new measurement window."""
-        self._max_cpu_percent.value = 0.0
+        with self._max_cpu_percent.get_lock():
+            self._max_cpu_percent.value = 0.0
 
+
+# Module-level store for shared memory handles to prevent leaks during re-initialization.
+_METRIC_STORE: dict[str, Any] = {}
+_METRIC_STORE_LOCK = threading.Lock()
+
+def _get_shared_metrics() -> WorkerPoolMetrics:
+    """Retrieve or initialize persistent shared memory segment."""
+    global _METRIC_STORE
+    with _METRIC_STORE_LOCK:
+        if not _METRIC_STORE:
+            # Use 'L' (unsigned long) for counters and 'd' (double) for averages.
+            _METRIC_STORE['metrics'] = WorkerPoolMetrics(
+                jobs_processed=multiprocessing.Value('L', 0),
+                jobs_failed=multiprocessing.Value('L', 0),
+                jobs_retried=multiprocessing.Value('L', 0),
+                avg_queue_depth=multiprocessing.Value('d', 0.0),
+                avg_latency_ms=multiprocessing.Value('d', 0.0),
+                avg_queue_latency_ms=multiprocessing.Value('d', 0.0),
+                queue_depth_samples=multiprocessing.Value('L', 0),
+                latency_samples=multiprocessing.Value('L', 0),
+                queue_latency_samples=multiprocessing.Value('L', 0),
+                memory_mb=multiprocessing.Value('d', 0.0),
+                cpu_percent=multiprocessing.Value('d', 0.0),
+                max_cpu_percent=multiprocessing.Value('d', 0.0),
+                lock=multiprocessing.RLock()
+            )
+        return _METRIC_STORE['metrics']
 
 class TelemetryCollector:
     """Telemetry collection and OTel instrumentation manager."""
@@ -196,35 +249,20 @@ class TelemetryCollector:
         prefer_otel: bool = True,
         meter_name: str = "celery.worker.telemetry"
     ) -> None:
-        """Initialize telemetry manager and shared metrics segment."""
+        """Initialize telemetry manager."""
         self.enabled = enabled
-        self.otel_enabled = enabled and prefer_otel and OTEL_AVAILABLE
-        self.metrics: WorkerPoolMetrics | None = None
-        
-        if enabled:
-            # Persistent shared memory segment to avoid leaks during pool restarts.
-            self.metrics = WorkerPoolMetrics(
-                jobs_processed=multiprocessing.Value('i', 0),
-                jobs_failed=multiprocessing.Value('i', 0),
-                jobs_retried=multiprocessing.Value('i', 0),
-                avg_queue_depth=multiprocessing.Value('d', 0.0),
-                avg_latency_ms=multiprocessing.Value('d', 0.0),
-                avg_queue_latency_ms=multiprocessing.Value('d', 0.0),
-                queue_depth_samples=multiprocessing.Value('i', 0),
-                latency_samples=multiprocessing.Value('i', 0),
-                queue_latency_samples=multiprocessing.Value('i', 0),
-                memory_mb=multiprocessing.Value('d', 0.0),
-                cpu_percent=multiprocessing.Value('d', 0.0),
-                max_cpu_percent=multiprocessing.Value('d', 0.0),
-                lock=multiprocessing.RLock()
-            )
-        
-        if self.otel_enabled:
-            self._setup_otel(meter_name)
+        self.prefer_otel = prefer_otel
+        self.meter_name = meter_name
+        self.otel_enabled = False
+        self.metrics: WorkerPoolMetrics | None = _get_shared_metrics() if enabled else None
 
-    def _setup_otel(self, meter_name: str) -> None:
-        """Initialize OpenTelemetry instruments."""
-        meter = get_meter(meter_name)
+    def setup_otel(self) -> None:
+        """Explicitly initialize OpenTelemetry to avoid fork-based deadlocks."""
+        if not self.enabled or not self.prefer_otel or not OTEL_AVAILABLE:
+            return
+            
+        self.otel_enabled = True
+        meter = get_meter(self.meter_name)
         
         if UpDownCounter:
             self.queue_depth_counter = meter.create_up_down_counter(
@@ -282,7 +320,6 @@ class TelemetryCollector:
         if not self.enabled or start_time <= 0:
             return
         
-        # Record timestamp before lock acquisition to minimize contention.
         latency = time.perf_counter() - start_time
         
         if self.metrics:
