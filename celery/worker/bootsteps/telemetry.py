@@ -6,6 +6,7 @@ import contextlib
 import threading
 import time
 import json
+import socket
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING, Any
@@ -41,11 +42,11 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.end_headers()
             
     def log_message(self, format: str, *args: Any) -> None:
-        """Suppress default HTTP server logging to avoid log noise."""
+        """Suppress default HTTP server logging."""
         pass
 
 class BoundedDict(OrderedDict):
-    """A thread-safe dictionary with a maximum capacity to prevent unbounded memory growth."""
+    """Thread-safe dictionary with maximum capacity."""
     def __init__(self, maxlen: int = 1000, *args: Any, **kwargs: Any) -> None:
         self.maxlen = maxlen
         self._lock = threading.Lock()
@@ -62,41 +63,27 @@ class BoundedDict(OrderedDict):
             return super().pop(key, default)
 
 class TelemetryBootstep(bootsteps.Step):
-    """Integrated telemetry collection via Celery's bootstep lifecycle.
-    
-    Ensures metrics are initialized when the consumer starts and provides 
-    hooks into task lifecycle events via Celery's signal system.
-    """
+    """Integrated telemetry collection via Celery bootstep lifecycle."""
     
     requires = ('celery.worker.consumer:Consumer',)
     
     def __init__(self, consumer: Consumer, **kwargs: Any) -> None:
-        """Initializes the bootstep.
-        
-        Args:
-            consumer: The worker consumer instance.
-            **kwargs: Step configuration.
-        """
+        """Initialize the bootstep."""
         self.consumer: Consumer = consumer
         worker_options: dict[str, Any] = getattr(consumer.app.conf, 'worker_telemetry', {})
         self.enabled: bool = worker_options.get('enabled', False)
         self.interval: float = worker_options.get('collection_interval_s', 60.0)
-        self.http_port: int = worker_options.get('http_port', 9808)
+        self.base_port: int = worker_options.get('http_port', 9808)
         
         self._stop_event: threading.Event = threading.Event()
         self._thread: threading.Thread | None = None
         self._http_server: HTTPServer | None = None
         self._http_thread: threading.Thread | None = None
         self._signal_connections: list[Any] = []
-        
-        # Bounded dictionary for thread-safe local tracking.
-        # Note: In prefork pools, task_received fires in the parent, while 
-        # task_prerun fires in the child. We attach timing to the request object 
-        # to bridge this gap.
         self._task_start_times: BoundedDict = BoundedDict(maxlen=2000)
 
     def create(self, consumer: Consumer) -> None:
-        """Sets up telemetry resources during consumer creation."""
+        """Initialize telemetry resources."""
         if not self.enabled:
             return
         
@@ -105,7 +92,6 @@ class TelemetryBootstep(bootsteps.Step):
         
         self._connect_signals()
         
-        # Background thread monitors resources without blocking the event loop.
         self._thread = threading.Thread(
             target=self._monitor_loop,
             args=(consumer, collector),
@@ -114,25 +100,31 @@ class TelemetryBootstep(bootsteps.Step):
         )
         self._thread.start()
         
-        # Start Out-of-Band HTTP Server
-        try:
-            self._http_server = HTTPServer(('0.0.0.0', self.http_port), MetricsHandler)
-            self._http_thread = threading.Thread(
-                target=self._http_server.serve_forever,
-                daemon=True,
-                name="CeleryTelemetryHTTP"
-            )
-            self._http_thread.start()
-            logger.info("Worker telemetry bootstep active. Metrics at http://0.0.0.0:%d/metrics", self.http_port)
-        except Exception as e:
-            logger.error("Failed to start telemetry HTTP server on port %d: %s", self.http_port, e)
+        self._start_http_server()
+
+    def _start_http_server(self) -> None:
+        """Start out-of-band HTTP server with port hunting."""
+        # Try up to 10 consecutive ports to avoid collisions on multi-worker hosts.
+        for port in range(self.base_port, self.base_port + 10):
+            try:
+                self._http_server = HTTPServer(('0.0.0.0', port), MetricsHandler)
+                self._http_thread = threading.Thread(
+                    target=self._http_server.serve_forever,
+                    daemon=True,
+                    name="CeleryTelemetryHTTP"
+                )
+                self._http_thread.start()
+                logger.info("Worker telemetry active. Metrics at http://0.0.0.0:%d/metrics", port)
+                return
+            except socket.error as e:
+                if port == self.base_port + 9:
+                    logger.error("Failed to start telemetry HTTP server after 10 attempts: %s", e)
 
     def stop(self, consumer: Consumer) -> None:
-        """Ensures clean shutdown of telemetry threads and signal disconnects."""
+        """Ensure clean shutdown of telemetry threads and signal disconnects."""
         self._stop_event.set()
         
         if self._http_server:
-            # Shutdown the HTTP server
             self._http_server.shutdown()
             self._http_server.server_close()
             
@@ -145,7 +137,7 @@ class TelemetryBootstep(bootsteps.Step):
         self._disconnect_signals()
 
     def _connect_signals(self) -> None:
-        """Subscribes to task lifecycle signals."""
+        """Subscribe to task lifecycle signals."""
         from celery import signals
         self._signal_connections.extend([
             signals.task_received.connect(self._on_task_received, weak=False),
@@ -157,37 +149,34 @@ class TelemetryBootstep(bootsteps.Step):
         ])
 
     def _disconnect_signals(self) -> None:
-        """Removes signal subscriptions to prevent memory leaks."""
+        """Remove signal subscriptions."""
         for conn in self._signal_connections:
             with contextlib.suppress(Exception):
                 conn.disconnect()
         self._signal_connections.clear()
 
     def _on_task_received(self, sender: Any = None, request: Any = None, **kwargs: Any) -> None:
-        """Updates queue depth metrics.
+        """Update queue depth metrics.
         
-        Fires in the MainProcess. We attach a receipt timestamp to the request
-        to track 'Time in Queue' when it eventually reaches a child worker.
+        Attaches receipt timestamp to request to track time-of-flight across prefork processes.
         """
         if request:
             request.telemetry_received_at = time.perf_counter()
         get_collector().record_job_received(1)
 
     def _on_task_prerun(self, task_id: str | None = None, task: Any = None, **kwargs: Any) -> None:
-        """Records task start time for execution latency calculation.
-        
-        Fires in the Child Worker Process.
-        """
+        """Record task start time and queue latency."""
         now = time.perf_counter()
         if task:
             task._telemetry_start_time = now
             request = getattr(task, 'request', None)
             if request and hasattr(request, 'telemetry_received_at'):
                 queue_latency = now - request.telemetry_received_at
+                get_collector().record_queue_latency(queue_latency)
                 logger.debug("Task %s queue latency: %.4fs", task_id, queue_latency)
 
     def _on_task_postrun(self, task_id: str | None = None, task: Any = None, state: str | None = None, **kwargs: Any) -> None:
-        """Calculates task processing latency and updates completion metrics."""
+        """Calculate processing latency and update completion metrics."""
         start_time = getattr(task, '_telemetry_start_time', 0.0) if task else 0.0
         
         status = 'success'
@@ -199,18 +188,19 @@ class TelemetryBootstep(bootsteps.Step):
         get_collector().record_job_completed(start_time, status=status)
 
     def _on_task_cleanup(self, task_id: str | None = None, **kwargs: Any) -> None:
-        """Explicit cleanup for revoked or rejected tasks."""
+        """Purge metadata for aborted tasks."""
         if task_id:
             self._task_start_times.pop(task_id, None)
 
     def _on_worker_shutdown(self, **kwargs: Any) -> None:
-        """Logs worker termination in the telemetry stream."""
+        """Log worker termination."""
         get_collector().record_job_received(-1)
 
     def _monitor_loop(self, consumer: Consumer, collector: Any) -> None:
         """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
+            # Prime CPU measurement.
             proc.cpu_percent(interval=None)
             
         while not self._stop_event.wait(self.interval):
@@ -219,7 +209,7 @@ class TelemetryBootstep(bootsteps.Step):
                     mem = proc.memory_info().rss / (1024 * 1024)
                     cpu = proc.cpu_percent(interval=None)
                     collector.record_resource_usage(memory_mb=mem, cpu_percent=cpu)
-                    logger.debug("Telemetry heartbeat recorded (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
+                    logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
                 else:
                     logger.debug("Resource monitoring skip: psutil not available")
             except Exception as e:

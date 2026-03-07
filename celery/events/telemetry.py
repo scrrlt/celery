@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+import random
 from collections import defaultdict, OrderedDict
 from typing import Any, TYPE_CHECKING, Final
 
@@ -20,73 +21,52 @@ logger = get_logger(__name__)
 # PEP 695: Python 3.12 Type Aliases
 type EventSummary = dict[str, Any]
 
-# Max task names to track to prevent unbounded memory growth
+# Bounding limits for telemetry tracking.
 MAX_TASK_NAMES_TRACKED: Final[int] = 500
-# Max unique event types to track
 MAX_EVENT_TYPES_TRACKED: Final[int] = 100
 
-# Normalization regex to prevent Cardinality Explosion in monitoring backends
+# Normalization regex to prevent cardinality explosion.
 _NORMALIZE_ID_REGEX = re.compile(r'[\d\-a-fA-F]{8,}')
 
 def _normalize_task_name(name: str) -> str:
-    """Strips UUIDs and long numeric identifiers from task names."""
+    """Strip UUIDs and long identifiers from task names."""
+    if not any(c.isdigit() for c in name):
+        return name
     return _NORMALIZE_ID_REGEX.sub('<id>', name)
 
 class EventTelemetry:
-    """Aggregator for internal event stream metrics.
-    
-    This class captures the frequency and performance of Celery's internal 
-    event-based communication system.
-    """
+    """Tracks internal event frequency and dispatch latency."""
     
     def __init__(self, enabled: bool = False, track_tasks: bool = False) -> None:
-        """Initializes the telemetry aggregator.
-        
-        Args:
-            enabled: Whether event metrics are active.
-            track_tasks: Opt-in to granular per-task name tracking (high cardinality).
-        """
+        """Initialize telemetry aggregator."""
         self.enabled: bool = enabled
         self.track_tasks: bool = track_tasks
         self.event_counts: OrderedDict[str, int] = OrderedDict()
-        
-        # Bounded cache for per-task event counts to prevent memory leaks.
-        # Only used if track_tasks is enabled to avoid cardinality explosion.
         self.task_event_counts: OrderedDict[str, dict[str, int]] = OrderedDict()
-        
         self.avg_dispatch_latency_ms: float = 0.0
-        
-        # RLock allows safe metric updates from various internal event hooks
         self._lock: threading.RLock = threading.RLock()
 
     def __getstate__(self) -> dict[str, Any]:
-        """Excludes the lock from serialization."""
+        """Exclude lock from serialization."""
         state = self.__dict__.copy()
         state.pop('_lock', None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restores the lock after deserialization."""
+        """Restore lock after deserialization."""
         self.__dict__.update(state)
         self._lock = threading.RLock()
 
     def record_dispatch(self, event_type: str, duration: float, task_name: str | None = None) -> None:
-        """Logs an event dispatch and its associated latency.
-        
-        Args:
-            event_type: The string identifier of the event (e.g., 'task-sent').
-            duration: Dispatch time in seconds.
-            task_name: Optional task identifier for granular tracking.
-        """
+        """Log event dispatch and latency using non-blocking lock."""
         if not self.enabled:
             return
             
         latency_ms = duration * 1000.0
         
-        # Non-blocking acquire prevents deadlocks during signal re-entrancy
         if self._lock.acquire(blocking=False):
             try:
-                # Bounded global event type tracking
+                # Track global event types with bounding.
                 if event_type not in self.event_counts:
                     if len(self.event_counts) >= MAX_EVENT_TYPES_TRACKED:
                         self.event_counts.popitem(last=False)
@@ -94,7 +74,7 @@ class EventTelemetry:
                 self.event_counts[event_type] += 1
                 self.event_counts.move_to_end(event_type)
                 
-                # EMA for dispatch latency
+                # Update EMA for dispatch latency.
                 if self.avg_dispatch_latency_ms == 0.0:
                     self.avg_dispatch_latency_ms = latency_ms
                 else:
@@ -112,11 +92,7 @@ class EventTelemetry:
                 self._lock.release()
 
     def get_event_summary(self) -> EventSummary:
-        """Returns a snapshot of event statistics.
-        
-        Returns:
-            Dictionary containing global and per-task event counts.
-        """
+        """Return snapshot of event statistics."""
         with self._lock:
             return {
                 "global_counts": dict(self.event_counts),
@@ -125,47 +101,37 @@ class EventTelemetry:
             }
 
 class TelemetryDispatcher(BaseEventDispatcher):
-    """Event dispatcher wrapper that captures performance metrics.
-    
-    This class extends the standard EventDispatcher to provide integrated 
-    telemetry without requiring modifications to the dispatcher's callers.
-    """
+    """Event dispatcher wrapper capturing performance metrics."""
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initializes the dispatcher and its telemetry state."""
+        """Initialize dispatcher with sampling support."""
         enable_telemetry: bool = kwargs.pop('enable_telemetry', False)
-        # Opt-in per-task tracking to control cardinality and cost.
         track_tasks: bool = kwargs.pop('telemetry_track_tasks', False)
+        self.sample_rate: float = kwargs.pop('telemetry_sample_rate', 1.0)
         
         super().__init__(*args, **kwargs)
         self.telemetry: EventTelemetry = EventTelemetry(
             enabled=enable_telemetry, 
             track_tasks=track_tasks
         )
-        # We hold a reference to the global collector to avoid repeated lookup in hot paths
         self.worker_collector = get_collector()
 
     def send(self, type_: str, **fields: Any) -> Event:
-        """Intercepts the send call to record telemetry metrics.
-        
-        Args:
-            type_: The event type identifier.
-            **fields: Additional event metadata.
-            
-        Returns:
-            The created Event object from the base implementation.
-        """
+        """Intercept send call to record metrics with sampling."""
+        # Performance optimization: Skip metrics if disabled or via sampling.
+        if not self.telemetry.enabled or (self.sample_rate < 1.0 and random.random() > self.sample_rate):
+            return super().send(type_, **fields)
+
         start_time: float = time.perf_counter()
         try:
             event: Event = super().send(type_, **fields)
             duration: float = time.perf_counter() - start_time
             
-            # Robust Task Name Extraction: Check common field names across Celery versions.
+            # Extract task name robustly.
             task_name: str | None = fields.get('task') or fields.get('name')
             self.telemetry.record_dispatch(type_, duration, task_name=task_name)
             
-            # We explicitly bridge completion events to ensure worker-level latency is captured.
-            # Bridges task-retried as well for production visibility.
+            # Bridge task lifecycle events for worker visibility.
             if self.worker_collector:
                 if type_ == 'task-succeeded':
                     self.worker_collector.record_job_completed(fields.get('timestamp', 0.0), status='success')
@@ -176,9 +142,8 @@ class TelemetryDispatcher(BaseEventDispatcher):
                     
             return event
         except Exception:
-            # We preserve existing error propagation to ensure zero impact on task reliability
             raise
 
 def create_enhanced_dispatcher(*args: Any, **kwargs: Any) -> TelemetryDispatcher:
-    """Factory function for creating integrated TelemetryDispatcher instances."""
+    """Factory for integrated TelemetryDispatcher instances."""
     return TelemetryDispatcher(*args, **kwargs)

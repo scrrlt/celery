@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import functools
 from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable
 
 from celery.exceptions import ImproperlyConfigured
@@ -26,13 +27,13 @@ class ValidationError(ImproperlyConfigured):
         self.value = value
 
 class OptionSchema:
-    """Metadata and validation logic for a single configuration option.
+    """Metadata and validation logic for a configuration option.
     
     Attributes:
-        name: The canonical Celery setting name.
-        expected_type: The primary Python type or tuple of types expected.
-        default: The fallback value if not provided.
-        validator: An optional callable for complex logical checks.
+        name: Canonical Celery setting name.
+        expected_type: Expected Python type or tuple of types.
+        default: Fallback value if not provided.
+        validator: Optional callable for complex logic.
     """
     __slots__ = ("name", "expected_type", "default", "validator")
 
@@ -49,16 +50,10 @@ class OptionSchema:
         self.validator = validator
 
     def validate(self, value: Any) -> Any:
-        """Coerces and validates a value against the schema.
+        """Coerce and validate a value against the schema.
         
-        Args:
-            value: The input value to check.
-            
-        Returns:
-            The coerced/validated value.
-            
         Raises:
-            ValidationError: If types mismatch or logical validation fails.
+            ValidationError: If type mismatch or logic fails.
         """
         if value is None:
             return self.default
@@ -94,14 +89,18 @@ def validate_range(min_val: float | None = None, max_val: float | None = None) -
         return value
     return _check
 
+@functools.lru_cache(maxsize=128)
+def _compile_regex(pattern: str) -> re.Pattern:
+    """Internal cache for compiled regex objects."""
+    return re.compile(pattern)
+
 def validate_regex(pattern: str) -> ValidatorFunc:
     """Factory for string regex validators.
     
-    Handles both single strings and sequences (e.g., list of URLs).
+    Handles both single strings and sequences.
     """
-    regex = re.compile(pattern)
+    regex = _compile_regex(pattern)
     def _check(value: Any, name: str) -> Any:
-        # Support for list/tuple values (like multiple broker URLs)
         values_to_check: Iterable[Any] = [value] if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [value])
         
         for val in values_to_check:
@@ -122,7 +121,7 @@ def validate_choice(choices: Container) -> ValidatorFunc:
         return value
     return _check
 
-# Core system settings that are frequently misconfigured in production.
+# Core system settings frequently misconfigured in production.
 CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
     'broker_url': OptionSchema('broker_url', (str, list), validator=validate_regex(r'^(redis|rediss|amqp|amqps|sqs|memory|sentinel)')),
     'worker_concurrency': OptionSchema('worker_concurrency', int, default=4, validator=validate_range(1, 1000)),
@@ -133,18 +132,15 @@ CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
 }
 
 class ConfigurationValidator:
-    """Orchestrator for application-wide configuration audits."""
+    """Validator for application configuration."""
     
     def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
         self.schema = schema or CELERY_CORE_SCHEMA
         self.errors: list[ValidationError] = []
 
     def validate(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Validates all known keys in the provided configuration dictionary.
+        """Validate all known keys in the provided configuration.
         
-        Args:
-            config: The raw configuration to audit.
-            
         Returns:
             A new dictionary containing validated and coerced values.
         """

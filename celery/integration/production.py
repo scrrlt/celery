@@ -18,15 +18,9 @@ def enable_production_telemetry(
     telemetry_enabled: bool = True,
     validation_enabled: bool = True,
 ) -> None:
-    """Configures telemetry and health monitoring.
+    """Configure telemetry and health monitoring.
     
-    This function initializes worker metrics and registers monitoring tasks
-    during the application bootstrapping phase.
-    
-    Args:
-        app: The Celery application instance.
-        telemetry_enabled: Whether to enable worker pool metrics.
-        validation_enabled: Whether to enable runtime configuration checks.
+    Initialize metrics and register monitoring tasks.
     """
     logger.info("Enabling telemetry components")
     
@@ -35,8 +29,7 @@ def enable_production_telemetry(
         logger.info("Worker pool telemetry active")
 
     if validation_enabled:
-        # Delay validation until after the application configuration is finalized.
-        # This prevents issues where early validation reads un-finalized PendingConfiguration objects.
+        # Delay validation until application configuration is finalized.
         @app.on_after_finalize.connect(weak=False)
         def _validate_config(sender: Celery, **kwargs: Any) -> None:
             validator = ConfigurationValidator()
@@ -47,23 +40,14 @@ def enable_production_telemetry(
             except Exception as exc:
                 logger.error("Configuration validation failed during finalization: %s", exc)
 
-    # Register internal tasks used for fleet-wide health aggregation.
     _add_health_tasks(app)
 
 def _add_health_tasks(app: Celery) -> None:
-    """Registers internal health monitoring tasks.
-    
-    These tasks enable tools to query worker health via the message broker.
-    """
+    """Register internal tasks for remote health monitoring."""
     
     @app.task(name='celery.internal.telemetry.health_summary', bind=True, ignore_result=True)
     def get_health_summary(self) -> dict[str, Any]:
-        """Returns a snapshot of worker performance and queue stats.
-        
-        Returns:
-            A dictionary containing rolling window averages and resource usage.
-            Always returns a consistent dictionary schema.
-        """
+        """Return snapshot of worker performance and queue stats."""
         collector = get_collector()
         summary = collector.get_summary()
         if summary is None:
@@ -81,9 +65,5 @@ def _add_health_tasks(app: Celery) -> None:
 
     @app.task(name='celery.health.ping', ignore_result=True)
     def ping() -> str:
-        """Lightweight responsiveness check.
-        
-        Returns:
-            The literal string "pong".
-        """
+        """Lightweight responsiveness check."""
         return "pong"
