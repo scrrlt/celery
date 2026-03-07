@@ -6,8 +6,14 @@ import re
 import threading
 import time
 import random
+import queue
 from collections import defaultdict, OrderedDict
-from typing import Any, TYPE_CHECKING, Final
+from typing import Any, TYPE_CHECKING, Final, Union, Optional
+
+try:
+    from typing import TypeAlias
+except ImportError:
+    from typing_extensions import TypeAlias
 
 from celery.events.dispatcher import EventDispatcher as BaseEventDispatcher
 from celery.utils.log import get_logger
@@ -18,12 +24,14 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# PEP 695: Python 3.12 Type Aliases
-type EventSummary = dict[str, Any]
+# PEP 613: TypeAlias for backward compatibility with Python < 3.12
+EventSummary: TypeAlias = dict[str, Any]
 
 # Bounding limits for telemetry tracking.
 MAX_TASK_NAMES_TRACKED: Final[int] = 500
 MAX_EVENT_TYPES_TRACKED: Final[int] = 100
+# Limit unique event types per task to prevent memory leaks
+MAX_EVENT_TYPES_PER_TASK: Final[int] = 20
 
 # Normalization regex to prevent cardinality explosion.
 _NORMALIZE_ID_REGEX = re.compile(r'[\d\-a-fA-F]{8,}')
@@ -42,52 +50,85 @@ class EventTelemetry:
         self.enabled = enabled
         self.track_tasks = track_tasks
         self.event_counts: OrderedDict[str, int] = OrderedDict()
-        self.task_event_counts: OrderedDict[str, dict[str, int]] = OrderedDict()
+        self.task_event_counts: OrderedDict[str, OrderedDict[str, int]] = OrderedDict()
         self.avg_dispatch_latency_ms = 0.0
+        
+        # Use a queue for non-blocking collection to avoid contention bias.
+        self._queue: queue.Queue[tuple[str, float, Optional[str]]] = queue.Queue(maxsize=1000)
         self._lock = threading.RLock()
+        
+        if enabled:
+            self._worker_thread = threading.Thread(
+                target=self._process_queue,
+                daemon=True,
+                name="CeleryEventTelemetryProcessor"
+            )
+            self._worker_thread.start()
 
     def __getstate__(self) -> dict[str, Any]:
-        """Exclude lock from serialization."""
+        """Exclude lock and thread from serialization."""
         state = self.__dict__.copy()
         state.pop('_lock', None)
+        state.pop('_worker_thread', None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore lock after deserialization."""
+        """Restore state after deserialization."""
         self.__dict__.update(state)
         self._lock = threading.RLock()
+        # Thread is not restarted here as it should be managed by the collector lifecycle.
 
     def record_dispatch(self, event_type: str, duration: float, task_name: str | None = None) -> None:
-        """Log event dispatch and latency using non-blocking lock."""
+        """Enqueue event metrics for non-blocking background processing."""
         if not self.enabled:
             return
-            
-        latency_ms = duration * 1000.0
-        
-        if self._lock.acquire(blocking=False):
+        try:
+            self._queue.put_nowait((event_type, duration, task_name))
+        except queue.Full:
+            pass # Drop metrics under extreme pressure to protect hot path.
+
+    def _process_queue(self) -> None:
+        """Background worker to update metrics without blocking dispatchers."""
+        while True:
             try:
-                if event_type not in self.event_counts:
-                    if len(self.event_counts) >= MAX_EVENT_TYPES_TRACKED:
-                        self.event_counts.popitem(last=False)
-                    self.event_counts[event_type] = 0
-                self.event_counts[event_type] += 1
-                self.event_counts.move_to_end(event_type)
+                event_type, duration, task_name = self._queue.get()
+                latency_ms = duration * 1000.0
                 
-                if self.avg_dispatch_latency_ms == 0.0:
-                    self.avg_dispatch_latency_ms = latency_ms
-                else:
-                    self.avg_dispatch_latency_ms = 0.9 * self.avg_dispatch_latency_ms + 0.1 * latency_ms
+                with self._lock:
+                    # Bounded global event type tracking.
+                    if event_type not in self.event_counts:
+                        if len(self.event_counts) >= MAX_EVENT_TYPES_TRACKED:
+                            self.event_counts.popitem(last=False)
+                        self.event_counts[event_type] = 0
+                    self.event_counts[event_type] += 1
+                    self.event_counts.move_to_end(event_type)
+                    
+                    # Update EMA for dispatch latency.
+                    if self.avg_dispatch_latency_ms == 0.0:
+                        self.avg_dispatch_latency_ms = latency_ms
+                    else:
+                        self.avg_dispatch_latency_ms = 0.9 * self.avg_dispatch_latency_ms + 0.1 * latency_ms
+                    
+                    if self.track_tasks and task_name:
+                        normalized_name = _normalize_task_name(task_name)
+                        if normalized_name not in self.task_event_counts:
+                            if len(self.task_event_counts) >= MAX_TASK_NAMES_TRACKED:
+                                self.task_event_counts.popitem(last=False)
+                            self.task_event_counts[normalized_name] = OrderedDict()
+                        
+                        task_counts = self.task_event_counts[normalized_name]
+                        if event_type not in task_counts:
+                            if len(task_counts) >= MAX_EVENT_TYPES_PER_TASK:
+                                task_counts.popitem(last=False)
+                            task_counts[event_type] = 0
+                        task_counts[event_type] += 1
+                        task_counts.move_to_end(event_type)
+                        self.task_event_counts.move_to_end(normalized_name)
                 
-                if self.track_tasks and task_name:
-                    normalized_name = _normalize_task_name(task_name)
-                    if normalized_name not in self.task_event_counts:
-                        if len(self.task_event_counts) >= MAX_TASK_NAMES_TRACKED:
-                            self.task_event_counts.popitem(last=False)
-                        self.task_event_counts[normalized_name] = defaultdict(int)
-                    self.task_event_counts[normalized_name][event_type] += 1
-                    self.task_event_counts.move_to_end(normalized_name)
-            finally:
-                self._lock.release()
+                self._queue.task_done()
+            except Exception:
+                logger.error("Error in telemetry processor", exc_info=True)
+                time.sleep(1)
 
     def get_event_summary(self) -> EventSummary:
         """Return snapshot of event statistics."""
@@ -103,9 +144,10 @@ class TelemetryDispatcher(BaseEventDispatcher):
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize dispatcher with sampling support."""
-        enable_telemetry = kwargs.pop('enable_telemetry', False)
-        track_tasks = kwargs.pop('telemetry_track_tasks', False)
-        self.sample_rate = kwargs.pop('telemetry_sample_rate', 1.0)
+        # Use get() to avoid silently consuming parameters intended for other subclasses.
+        enable_telemetry = kwargs.get('enable_telemetry', False)
+        track_tasks = kwargs.get('telemetry_track_tasks', False)
+        self.sample_rate = kwargs.get('telemetry_sample_rate', 1.0)
         
         super().__init__(*args, **kwargs)
         self.telemetry = EventTelemetry(

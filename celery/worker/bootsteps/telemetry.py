@@ -7,7 +7,7 @@ import threading
 import time
 import socket
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from celery import bootsteps
 from celery.utils.log import get_logger
@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 
 class BoundedDict(OrderedDict):
     """Thread-safe dictionary with maximum capacity."""
+    
     def __init__(self, maxlen: int = 1000, *args: Any, **kwargs: Any) -> None:
         self.maxlen = maxlen
         self._lock = threading.Lock()
@@ -33,15 +34,36 @@ class BoundedDict(OrderedDict):
     def __setitem__(self, key: Any, value: Any) -> None:
         """Add item while enforcing capacity limits."""
         with self._lock:
-            # Only evict if adding a NEW key would exceed capacity.
             if key not in self and len(self) >= self.maxlen:
                 self.popitem(last=False)
             super().__setitem__(key, value)
+
+    def __delitem__(self, key: Any) -> None:
+        """Safely remove an item."""
+        with self._lock:
+            super().__delitem__(key)
 
     def pop(self, key: Any, default: Any = None) -> Any:
         """Safely remove and return an item."""
         with self._lock:
             return super().pop(key, default)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        """Thread-safe batch update."""
+        with self._lock:
+            super().update(*args, **kwargs)
+            while len(self) > self.maxlen:
+                self.popitem(last=False)
+
+    def clear(self) -> None:
+        """Thread-safe clear."""
+        with self._lock:
+            super().clear()
+
+    def items_snapshot(self) -> Dict[Any, Any]:
+        """Return a thread-safe copy of current items."""
+        with self._lock:
+            return dict(self.items())
 
 class TelemetryBootstep(bootsteps.Step):
     """Integrated telemetry collection via Celery bootstep lifecycle."""
@@ -50,18 +72,18 @@ class TelemetryBootstep(bootsteps.Step):
     
     def __init__(self, consumer: Consumer, **kwargs: Any) -> None:
         """Initialize the bootstep."""
-        self.consumer: Consumer = consumer
+        self.consumer = consumer
         worker_options: dict[str, Any] = getattr(consumer.app.conf, 'worker_telemetry', {})
-        self.enabled: bool = worker_options.get('enabled', False)
-        self.interval: float = worker_options.get('collection_interval_s', 60.0)
-        self.base_port: int = worker_options.get('http_port', 9808)
+        self.enabled = worker_options.get('enabled', False)
+        self.interval = worker_options.get('collection_interval_s', 60.0)
+        self.base_port = worker_options.get('http_port', 9808)
         
-        self._stop_event: threading.Event = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
         self._http_server: Any = None
-        self._http_thread: threading.Thread | None = None
-        self._signal_connections: list[Any] = []
-        self._task_start_times: BoundedDict = BoundedDict(maxlen=2000)
+        self._http_thread: Optional[threading.Thread] = None
+        self._signal_connections: List[Any] = []
+        self._task_start_times = BoundedDict(maxlen=2000)
 
     def create(self, consumer: Consumer) -> None:
         """Initialize telemetry resources."""
@@ -71,14 +93,12 @@ class TelemetryBootstep(bootsteps.Step):
         init_telemetry(enabled=True)
         collector = get_collector()
         
-        # Single-process pool check (e.g., -P solo, -P threads).
-        # Since worker_process_init won't fire, we initialize OTel immediately.
+        # Immediate OTel setup for single-process environments.
         if getattr(consumer.pool, 'is_single_process', False):
             collector.setup_otel()
         
         self._connect_signals()
         
-        # Background monitor thread.
         self._thread = threading.Thread(
             target=self._monitor_loop,
             args=(consumer, collector),
@@ -90,7 +110,7 @@ class TelemetryBootstep(bootsteps.Step):
         self._start_http_server()
 
     def _start_http_server(self) -> None:
-        """Start out-of-band HTTP server with port hunting."""
+        """Start out-of-band HTTP server with port hunting and timeouts."""
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import json
 
@@ -108,12 +128,19 @@ class TelemetryBootstep(bootsteps.Step):
                     self.end_headers()
             def log_message(self, format: str, *args: Any) -> None: pass
 
-        # Try up to 10 consecutive ports to avoid collisions.
+        # Attempt to bind within a 10-port range.
         for port in range(self.base_port, self.base_port + 10):
             try:
-                # Use ThreadingHTTPServer to handle concurrent scrapes without blocking.
-                self._http_server = ThreadingHTTPServer(('0.0.0.0', port), MetricsHandler)
+                # Use SO_REUSEADDR to avoid port exhaustion during rapid restarts.
+                self._http_server = ThreadingHTTPServer(('0.0.0.0', port), MetricsHandler, bind_and_activate=False)
+                self._http_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._http_server.server_bind()
+                self._http_server.server_activate()
+                
+                # Set timeouts to prevent thread exhaustion from slow clients.
+                self._http_server.socket.settimeout(5.0)
                 self._http_server.daemon_threads = True
+                
                 self._http_thread = threading.Thread(
                     target=self._http_server.serve_forever,
                     daemon=True,
@@ -124,7 +151,7 @@ class TelemetryBootstep(bootsteps.Step):
                 return
             except socket.error as e:
                 if port == self.base_port + 9:
-                    logger.error("Failed to start telemetry HTTP server after 10 attempts: %s", e)
+                    logger.error("Failed to bind telemetry HTTP server after 10 attempts: %s", e)
 
     def stop(self, consumer: Consumer) -> None:
         """Ensure clean shutdown of telemetry resources."""
@@ -211,11 +238,12 @@ class TelemetryBootstep(bootsteps.Step):
         """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
-            # Prime CPU measurement.
+            # Prime CPU measurement utilization since last call.
             proc.cpu_percent(interval=None)
             
         sample_interval = max(1.0, self.interval / 10.0)
         sample_count = 0
+        consecutive_errors = 0
         
         while not self._stop_event.wait(sample_interval):
             try:
@@ -225,10 +253,15 @@ class TelemetryBootstep(bootsteps.Step):
                     cpu = proc.cpu_percent(interval=None)
                     collector.record_resource_usage(memory_mb=mem, cpu_percent=cpu)
                     
-                    # Log heartbeat every 10 samples (matching the primary interval).
+                    # Log heartbeat every 10 samples (matching reporting interval).
                     if sample_count % 10 == 0:
                         logger.debug("Telemetry heartbeat (RSS=%.2fMB, CPU=%.1f%%)", mem, cpu)
+                    consecutive_errors = 0 # Reset on success
                 else:
                     logger.debug("Resource monitoring skip: psutil not available")
             except Exception as e:
-                logger.debug("Resource monitoring error: %s", e)
+                consecutive_errors += 1
+                logger.debug("Resource monitoring error (%d): %s", consecutive_errors, e)
+                if consecutive_errors >= 5:
+                    logger.error("Persistent resource monitoring failure. Shutting down monitor thread.")
+                    break

@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 import re
 import functools
-from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable, final
+from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable, Union
+
+try:
+    from typing import TypeAlias, final
+except ImportError:
+    from typing_extensions import TypeAlias, final
 
 from celery.exceptions import ImproperlyConfigured
 from celery.utils.log import get_logger
@@ -15,8 +20,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# PEP 695: Python 3.12 Type Aliases - Publicly exported
-type ValidatorFunc = Callable[[Any, str], Any]
+# PEP 613: TypeAlias for backward compatibility with Python < 3.12
+ValidatorFunc: TypeAlias = Callable[[Any, str], Any]
 
 class ValidationError(ImproperlyConfigured):
     """Raised when a configuration value fails validation."""
@@ -61,12 +66,14 @@ class OptionSchema:
 
         if not isinstance(value, self.expected_type):
             try:
-                # Attempt basic coercion for environment-variable compatibility
-                if self.expected_type is int:
+                # Support for tuple expected_type in identity-based coercion
+                types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
+                
+                if int in types:
                     value = int(value)
-                elif self.expected_type is float:
+                elif float in types:
                     value = float(value)
-                elif self.expected_type is bool and isinstance(value, str):
+                elif bool in types and isinstance(value, str):
                     value = value.lower() in ("true", "1", "yes", "on")
             except (ValueError, TypeError) as exc:
                 raise ValidationError(
@@ -81,7 +88,7 @@ class OptionSchema:
         return value
 
 def validate_range(min_val: float | None = None, max_val: float | None = None) -> ValidatorFunc:
-    """Factory for numeric range validators."""
+    """Create a numeric range validator."""
     def _check(value: Any, name: str) -> Any:
         if min_val is not None and value < min_val:
             raise ValidationError(f"{name!r} is below minimum {min_val}", name, value)
@@ -92,14 +99,11 @@ def validate_range(min_val: float | None = None, max_val: float | None = None) -
 
 @functools.lru_cache(maxsize=128)
 def _compile_regex(pattern: str) -> re.Pattern:
-    """Internal cache for compiled regex objects."""
+    """Cache compiled regex objects."""
     return re.compile(pattern)
 
 def validate_regex(pattern: str) -> ValidatorFunc:
-    """Factory for string regex validators.
-    
-    Handles both single strings and sequences.
-    """
+    """Create a string regex validator."""
     regex = _compile_regex(pattern)
     def _check(value: Any, name: str) -> Any:
         values_to_check: Iterable[Any] = [value] if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [value])
@@ -111,7 +115,7 @@ def validate_regex(pattern: str) -> ValidatorFunc:
     return _check
 
 def validate_choice(choices: Container) -> ValidatorFunc:
-    """Factory for choice-based string validators."""
+    """Create a choice-based string validator."""
     def _check(value: Any, name: str) -> Any:
         if value not in choices:
             raise ValidationError(
@@ -133,7 +137,7 @@ CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
 }
 
 class ConfigurationValidator:
-    """Validator for application configuration."""
+    """Application configuration validator."""
     
     def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
         self.schema = schema or CELERY_CORE_SCHEMA
