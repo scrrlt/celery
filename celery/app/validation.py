@@ -46,12 +46,16 @@ class OptionSchema:
     def __init__(
         self,
         name: str,
-        expected_type: type | tuple[type, ...],
+        expected_type: Any,
         default: Any = None,
         validator: ValidatorFunc | None = None
     ) -> None:
         self.name = name
-        self.expected_type = expected_type
+        # Normalize expected_type to handle PEP 604 (int | float) on Python < 3.10.
+        if hasattr(expected_type, "__args__"):
+            self.expected_type = expected_type.__args__
+        else:
+            self.expected_type = expected_type
         self.default = default
         self.validator = validator
 
@@ -67,7 +71,7 @@ class OptionSchema:
         if not isinstance(value, self.expected_type):
             types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
             
-            # Iterative coercion ensures all allowed types are checked.
+            # Retry-loop for coercion ensures all allowed types are checked.
             success = False
             for target_type in types:
                 try:
@@ -76,16 +80,15 @@ class OptionSchema:
                     elif target_type is float:
                         value = float(value)
                     elif target_type is bool and isinstance(value, str):
-                        # Strict boolean mapping to prevent silent typos.
                         norm = value.lower()
                         if norm in ("true", "1", "yes", "on"):
                             value = True
                         elif norm in ("false", "0", "no", "off"):
                             value = False
                         else:
-                            continue 
+                            continue
                     else:
-                        continue 
+                        continue
                     
                     success = True
                     break
@@ -154,7 +157,7 @@ CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
 }
 
 class ConfigurationValidator:
-    """Application configuration validator."""
+    """Validate application configuration."""
     
     def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
         self.schema = schema or CELERY_CORE_SCHEMA

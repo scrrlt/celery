@@ -63,7 +63,8 @@ class BoundedDict(OrderedDict):
     def items_snapshot(self) -> Dict[Any, Any]:
         """Return a thread-safe copy of current items."""
         with self._lock:
-            return dict(self.copy())
+            # Traverse once to minimize lock contention.
+            return dict(self.items())
 
 class TelemetryBootstep(bootsteps.Step):
     """Integrated telemetry collection via Celery bootstep lifecycle."""
@@ -236,6 +237,8 @@ class TelemetryBootstep(bootsteps.Step):
         """Purge metadata for aborted tasks."""
         if task_id:
             self._task_start_times.pop(task_id, None)
+        # request can be passed from signal or extracted from task.
+        request = request or (getattr(kwargs.get('task'), 'request', None) if kwargs.get('task') else None)
         if request:
             with contextlib.suppress(AttributeError):
                 delattr(request, '_celery_telemetry_rx')
@@ -248,6 +251,7 @@ class TelemetryBootstep(bootsteps.Step):
         """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
+            # Prime CPU measurement utilization since last call.
             proc.cpu_percent(interval=None)
             
         sample_interval = max(1.0, self.interval / 10.0)

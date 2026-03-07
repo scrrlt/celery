@@ -139,6 +139,7 @@ class WorkerPoolMetrics:
 
     def _update_ema(self, shared_avg: Value, shared_count: Value, new_val: float) -> None:
         """Update shared average using bias-corrected EMA to ensure smooth warm-up."""
+        # Use internal value lock for atomic updates.
         with shared_count.get_lock():
             shared_count.value += 1
             t = shared_count.value
@@ -147,11 +148,6 @@ class WorkerPoolMetrics:
             # Standard EMA: v_t = beta * v_t-1 + (1 - beta) * theta_t
             beta = 1.0 - self._alpha
             shared_avg.value = (beta * shared_avg.value) + (self._alpha * new_val)
-            
-            # Note: The property access for the summary already returns the 
-            # bias-corrected value implicitly if we were to apply it here,
-            # but for simplicity in distributed memory, we maintain the 
-            # running total and correct for bias during the first few samples.
 
     def record_queue_depth(self, depth: int) -> None:
         """Update queue depth average using EMA."""
@@ -196,7 +192,7 @@ class WorkerPoolMetrics:
             self._jobs_retried.value += 1
     
     def update_resources(self, memory_mb: float, cpu_percent: float) -> None:
-        """Update resource snapshots and peak CPU bursts."""
+        """Update resource snapshots and track peak CPU bursts."""
         with self._memory_mb.get_lock():
             self._memory_mb.value = memory_mb
         with self._cpu_percent.get_lock():
@@ -361,9 +357,10 @@ class TelemetryCollector:
         if not self.enabled or not self.metrics:
             return None
             
-        # Standard EMA Bias Correction: v_t / (1 - beta^t)
+        # Bias-corrected EMA summary logic.
         def _correct(val: float, count: int) -> float:
             if count == 0: return 0.0
+            # Standard bias correction: v_t / (1 - beta^t)
             beta_t = (1.0 - self.metrics._alpha) ** count
             return val / (1.0 - beta_t)
 

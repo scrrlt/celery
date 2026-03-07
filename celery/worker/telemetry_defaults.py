@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Final
 
 DEFAULT_WORKER_TELEMETRY: Final[dict[str, Any]] = {
-    'enabled': False,                # Opt-in only.
+    'enabled': False,                # Disabled by default to prevent overhead on legacy clusters.
     'collection_interval_s': 60.0,   # Est. overhead: <0.1% CPU.
     'health_log_interval_s': 300.0,  # Heartbeat logging frequency.
     'prefer_otel': True,             # Attempt OTel export if available.
