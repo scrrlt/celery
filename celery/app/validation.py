@@ -76,6 +76,7 @@ class OptionSchema:
         if not isinstance(value, self.expected_type):
             types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
             
+            # Retry-loop for coercion ensures all allowed types are checked.
             success = False
             for target_type in types:
                 try:
@@ -90,7 +91,7 @@ class OptionSchema:
                         elif norm in ("false", "0", "no", "off"):
                             value = False
                         else:
-                            continue
+                            continue 
                     else:
                         continue 
                     

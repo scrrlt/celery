@@ -32,8 +32,11 @@ MAX_TASK_NAMES_TRACKED: Final[int] = 500
 MAX_EVENT_TYPES_TRACKED: Final[int] = 100
 MAX_EVENT_TYPES_PER_TASK: Final[int] = 20
 
-# Normalization regex to prevent cardinality explosion (matches hex, UUIDs, and long integers).
-_NORMALIZE_ID_REGEX = re.compile(r'([\d\-a-fA-F]{8,})')
+# Specific normalization regex to prevent cardinality explosion without over-normalizing valid names.
+# Targets strict UUIDs and 32+ character hex strings.
+_NORMALIZE_ID_REGEX = re.compile(
+    r'\b([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}|[0-9a-fA-F]{32,})\b'
+)
 
 def _normalize_task_name(name: str) -> str:
     """Strip UUIDs and long identifiers from task names."""
@@ -93,7 +96,7 @@ class EventTelemetry:
         try:
             self._queue.put_nowait((event_type, duration, task_name))
         except queue.Full:
-            pass # Drop metrics under pressure to protect hot path.
+            pass # Drop metrics under pressure.
 
     def stop(self) -> None:
         """Stop metrics processor and flush queue."""

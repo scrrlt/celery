@@ -91,17 +91,14 @@ class TelemetryBootstep(bootsteps.Step):
         if not self.enabled:
             return
         
-        # init_telemetry is also called during config, but we ensure it's active here.
-        init_telemetry(enabled=True)
+        # Core telemetry collector is now initialized during config bootstrapping.
         collector = get_collector()
         
         if getattr(consumer.pool, 'is_single_process', False):
-            # No fork, initialize OTel immediately.
             collector.setup_otel()
         
         self._connect_signals()
         
-        # Background monitor thread.
         self._thread = threading.Thread(
             target=self._monitor_loop,
             args=(consumer, collector),
@@ -132,7 +129,7 @@ class TelemetryBootstep(bootsteps.Step):
             def log_message(self, format: str, *args: Any) -> None: pass
 
         class HardenedHTTPServer(ThreadingHTTPServer):
-            # Limit active threads to prevent DoS starvation.
+            # Protect against thread exhaustion.
             MAX_THREADS = 5
             _active_threads = 0
             _thread_lock = threading.Lock()
@@ -145,6 +142,7 @@ class TelemetryBootstep(bootsteps.Step):
                     self._active_threads += 1
                 
                 try:
+                    # Per-client socket timeout to prevent Slowloris.
                     request.settimeout(5.0)
                     super().finish_request(request, client_address)
                 finally:
@@ -157,8 +155,6 @@ class TelemetryBootstep(bootsteps.Step):
                 self._http_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self._http_server.server_bind()
                 self._http_server.server_activate()
-                
-                self._http_server.socket.settimeout(5.0)
                 self._http_server.daemon_threads = True
                 
                 self._http_thread = threading.Thread(
@@ -271,7 +267,7 @@ class TelemetryBootstep(bootsteps.Step):
         """Periodic background task for resource metric collection."""
         proc = psutil.Process() if psutil else None
         if proc:
-            # Prime CPU measurement.
+            # Prime CPU measurement utilization since last call.
             proc.cpu_percent(interval=None)
             
         sample_interval = max(1.0, self.interval / 10.0)
