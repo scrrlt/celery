@@ -31,6 +31,7 @@ EventSummary: TypeAlias = dict[str, Any]
 MAX_TASK_NAMES_TRACKED: Final[int] = 500
 MAX_EVENT_TYPES_TRACKED: Final[int] = 100
 MAX_EVENT_TYPES_PER_TASK: Final[int] = 20
+MAX_TASK_NAME_LENGTH: Final[int] = 200
 
 # Specific normalization regex to prevent cardinality explosion without over-normalizing valid names.
 # Targets strict UUIDs and 32+ character hex strings.
@@ -40,6 +41,10 @@ _NORMALIZE_ID_REGEX = re.compile(
 
 def _normalize_task_name(name: str) -> str:
     """Strip UUIDs and long identifiers from task names."""
+    # Prevent potential ReDoS by limiting input length
+    if len(name) > MAX_TASK_NAME_LENGTH:
+        name = name[:MAX_TASK_NAME_LENGTH]
+    
     # Fast path: skip regex if no numbers are present.
     if not any(c.isdigit() for c in name):
         return name

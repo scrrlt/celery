@@ -78,13 +78,17 @@ class TelemetryBootstep(bootsteps.Step):
         self.enabled = worker_options.get('enabled', False)
         self.interval = worker_options.get('collection_interval_s', 60.0)
         self.base_port = worker_options.get('http_port', 9808)
+        self.port_range = worker_options.get('port_range', 10)
         
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._http_server: Any = None
+        self._http_server: Optional[Any] = None
         self._http_thread: Optional[threading.Thread] = None
         self._signal_connections: List[Any] = []
-        self._task_start_times = BoundedDict(maxlen=2000)
+        
+        # Task tracking configuration
+        task_tracking_maxlen = worker_options.get('task_tracking_maxlen', 2000)
+        self._task_start_times = BoundedDict(maxlen=task_tracking_maxlen)
 
     def create(self, consumer: Consumer) -> None:
         """Initialize telemetry resources."""
@@ -149,7 +153,7 @@ class TelemetryBootstep(bootsteps.Step):
                     with self._thread_lock:
                         self._active_threads -= 1
 
-        for port in range(self.base_port, self.base_port + 10):
+        for port in range(self.base_port, self.base_port + self.port_range):
             try:
                 self._http_server = HardenedHTTPServer(('0.0.0.0', port), MetricsHandler, bind_and_activate=False)
                 self._http_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -166,8 +170,8 @@ class TelemetryBootstep(bootsteps.Step):
                 logger.info("Worker telemetry active. Bound to port %d. Metrics at /metrics", port)
                 return
             except socket.error as e:
-                if port == self.base_port + 9:
-                    logger.error("Failed to bind telemetry HTTP server after 10 attempts: %s", e)
+                if port == self.base_port + self.port_range - 1:
+                    logger.error("Failed to bind telemetry HTTP server after %d attempts: %s", self.port_range, e)
 
     def stop(self, consumer: Consumer) -> None:
         """Ensure clean shutdown of telemetry resources."""

@@ -515,7 +515,12 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                             _children = _meta.get('children')
                             _callbacks = task_request.callbacks
                             _chain = task_request.chain
-                            if (_callbacks or _chain) and not _children:
+                            # Only dispatch if children not tracked (result_extended=False)
+                            # or children list is explicitly empty (not None)
+                            should_dispatch = (_callbacks or _chain) and (
+                                _children is not None and len(_children) == 0
+                            )
+                            if should_dispatch:
                                 _dispatch_callbacks_and_chain(
                                     stored_retval, _callbacks, _chain,
                                     parent_id=uuid, root_id=_root_id,

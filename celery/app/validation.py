@@ -175,14 +175,16 @@ CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
 class ConfigurationValidator:
     """Application configuration validator."""
     
-    def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
+    def __init__(self, schema: dict[str, OptionSchema] | None = None, warning_only: bool = False) -> None:
         """Initialize configuration validator.
         
         Args:
             schema: Optional custom schema; defaults to core Celery settings.
+            warning_only: If True, log warnings instead of raising exceptions.
         """
         self.schema = schema or CELERY_CORE_SCHEMA
         self.errors: list[ValidationError] = []
+        self.warning_only = warning_only
 
     def validate(self, config: dict[str, Any]) -> dict[str, Any]:
         """Validate all known keys in the provided configuration.
@@ -199,6 +201,12 @@ class ConfigurationValidator:
                     validated[key] = schema.validate(config[key])
                 except ValidationError as exc:
                     self.errors.append(exc)
-                    logger.error("Configuration error: %s", exc)
+                    if self.warning_only:
+                        logger.warning("Configuration warning: %s", exc)
+                        # Keep original value for backward compatibility
+                        validated[key] = config[key]
+                    else:
+                        logger.error("Configuration error: %s", exc)
+                        # Still raise in strict mode
                     
         return validated

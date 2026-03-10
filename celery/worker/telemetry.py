@@ -116,8 +116,8 @@ class WorkerPoolMetrics:
         self._max_cpu_percent = max_cpu_percent
         self._lock = lock
         
-        self.alert_queue_depth_threshold = 1000
-        self.alert_latency_threshold_ms = 5000.0
+        self.alert_queue_depth_threshold = worker_options.get('alert_queue_depth_threshold', 1000)
+        self.alert_latency_threshold_ms = worker_options.get('alert_latency_threshold_ms', 5000.0)
         
         # Configurable EMA alpha coefficient.
         self._alpha = alpha
@@ -178,8 +178,11 @@ class WorkerPoolMetrics:
             
         with shared_avg.get_lock():
             # Standard EMA: v_t = beta * v_t-1 + (1 - beta) * theta_t
+            # Apply bias correction: v_corrected = v_t / (1 - beta^t)
             beta = 1.0 - self._alpha
-            shared_avg.value = (beta * shared_avg.value) + (self._alpha * new_val)
+            raw_ema = (beta * shared_avg.value) + (self._alpha * new_val)
+            bias_correction = 1.0 - (beta ** t)
+            shared_avg.value = raw_ema / max(bias_correction, 1e-8)  # Prevent division by zero
 
     def record_queue_depth(self, depth: int) -> None:
         """Update queue depth average using EMA."""
@@ -240,7 +243,7 @@ class WorkerPoolMetrics:
 
 
 # Persistent store for shared memory handles.
-_METRIC_STORE: dict[str, Any] = {}
+_METRIC_STORE: dict[str, WorkerPoolMetrics] = {}
 _METRIC_STORE_LOCK = threading.Lock()
 
 def _get_shared_metrics() -> WorkerPoolMetrics:
