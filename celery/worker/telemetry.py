@@ -84,6 +84,24 @@ class WorkerPoolMetrics:
         lock: BilliardRLock,
         alpha: float = 0.1
     ) -> None:
+        """Initialize shared memory metrics with EMA smoothing.
+        
+        Args:
+            jobs_processed: Atomic counter for completed tasks.
+            jobs_failed: Atomic counter for failed tasks.
+            jobs_retried: Atomic counter for retried tasks.
+            avg_queue_depth: EMA-smoothed queue depth.
+            avg_latency_ms: EMA-smoothed execution latency.
+            avg_queue_latency_ms: EMA-smoothed queue wait time.
+            queue_depth_samples: Sample count for bias correction.
+            latency_samples: Sample count for bias correction.
+            queue_latency_samples: Sample count for bias correction.
+            memory_mb: Current memory usage in MB.
+            cpu_percent: Current CPU utilization.
+            max_cpu_percent: Peak CPU utilization.
+            lock: Process-safe lock for atomic operations.
+            alpha: EMA smoothing coefficient (0.0-1.0).
+        """
         self._jobs_processed = jobs_processed
         self._jobs_failed = jobs_failed
         self._jobs_retried = jobs_retried
@@ -115,23 +133,41 @@ class WorkerPoolMetrics:
             self._avg_queue_latency_ms.value = 0.0
 
     @property
-    def jobs_processed(self) -> int: return self._jobs_processed.value
+    def jobs_processed(self) -> int: 
+        """Total completed tasks count."""
+        return self._jobs_processed.value
     @property
-    def jobs_failed(self) -> int: return self._jobs_failed.value
+    def jobs_failed(self) -> int: 
+        """Total failed tasks count."""
+        return self._jobs_failed.value
     @property
-    def jobs_retried(self) -> int: return self._jobs_retried.value
+    def jobs_retried(self) -> int: 
+        """Total retried tasks count."""
+        return self._jobs_retried.value
     @property
-    def avg_queue_depth(self) -> float: return self._avg_queue_depth.value
+    def avg_queue_depth(self) -> float: 
+        """EMA-smoothed queue depth."""
+        return self._avg_queue_depth.value
     @property
-    def avg_latency_ms(self) -> float: return self._avg_latency_ms.value
+    def avg_latency_ms(self) -> float: 
+        """EMA-smoothed execution latency in milliseconds."""
+        return self._avg_latency_ms.value
     @property
-    def avg_queue_latency_ms(self) -> float: return self._avg_queue_latency_ms.value
+    def avg_queue_latency_ms(self) -> float: 
+        """EMA-smoothed queue wait time in milliseconds."""
+        return self._avg_queue_latency_ms.value
     @property
-    def memory_mb(self) -> float: return self._memory_mb.value
+    def memory_mb(self) -> float: 
+        """Current worker memory usage in MB."""
+        return self._memory_mb.value
     @property
-    def cpu_percent(self) -> float: return self._cpu_percent.value
+    def cpu_percent(self) -> float: 
+        """Current worker CPU utilization percentage."""
+        return self._cpu_percent.value
     @property
-    def max_cpu_percent(self) -> float: return self._max_cpu_percent.value
+    def max_cpu_percent(self) -> float: 
+        """Peak worker CPU utilization percentage."""
+        return self._max_cpu_percent.value
 
     def _update_ema(self, shared_avg: Value, shared_count: Value, new_val: float) -> None:
         """Update shared average using bias-corrected EMA to ensure smooth warm-up."""

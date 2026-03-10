@@ -27,6 +27,13 @@ class ValidationError(ImproperlyConfigured):
     """Raised when a configuration value fails validation."""
     
     def __init__(self, message: str, option: str | None = None, value: Any = None) -> None:
+        """Initialize validation error with context.
+        
+        Args:
+            message: Human-readable error description.
+            option: Configuration option name that failed.
+            value: Invalid value that caused the failure.
+        """
         super().__init__(message)
         self.option = option
         self.value = value
@@ -50,6 +57,14 @@ class OptionSchema:
         default: Any = None,
         validator: ValidatorFunc | None = None
     ) -> None:
+        """Initialize option schema definition.
+        
+        Args:
+            name: Canonical Celery configuration setting name.
+            expected_type: Expected Python type or Union of types.
+            default: Default value when option is not provided.
+            validator: Optional custom validation function.
+        """
         self.name = name
         
         # Use standard library introspection to safely unwrap Unions/PEP 604 types.
@@ -161,6 +176,11 @@ class ConfigurationValidator:
     """Application configuration validator."""
     
     def __init__(self, schema: dict[str, OptionSchema] | None = None) -> None:
+        """Initialize configuration validator.
+        
+        Args:
+            schema: Optional custom schema; defaults to core Celery settings.
+        """
         self.schema = schema or CELERY_CORE_SCHEMA
         self.errors: list[ValidationError] = []
 
