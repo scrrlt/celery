@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import functools
+import types
 from typing import Any, Callable, Final, TYPE_CHECKING, Container, Iterable, Union, get_args, get_origin
 
 try:
@@ -69,7 +70,7 @@ class OptionSchema:
         
         # Use standard library introspection to safely unwrap Unions/PEP 604 types.
         origin = get_origin(expected_type)
-        if origin is Union or (hasattr(re, 'Pattern') and origin is getattr(Union, '__class__', None)):
+        if origin in (Union, getattr(types, 'UnionType', None)):
             self.expected_type = get_args(expected_type)
         elif hasattr(expected_type, "__args__"):
             self.expected_type = expected_type.__args__
@@ -82,6 +83,8 @@ class OptionSchema:
     def validate(self, value: Any) -> Any:
         """Coerce and validate a value against the schema.
         
+        Uses optimized type-specific coercion instead of retry loops.
+        
         Raises:
             ValidationError: If type mismatch or logic fails.
         """
@@ -91,33 +94,46 @@ class OptionSchema:
         if not isinstance(value, self.expected_type):
             types = self.expected_type if isinstance(self.expected_type, tuple) else (self.expected_type,)
             
-            # Retry-loop for coercion ensures all allowed types are checked.
-            success = False
-            for target_type in types:
-                try:
-                    if target_type is int:
-                        value = int(value)
-                    elif target_type is float:
-                        value = float(value)
-                    elif target_type is bool and isinstance(value, str):
-                        norm = value.lower()
-                        if norm in ("true", "1", "yes", "on"):
-                            value = True
-                        elif norm in ("false", "0", "no", "off"):
-                            value = False
-                        else:
-                            continue 
-                    else:
-                        continue 
-                    
-                    success = True
-                    break
-                except (ValueError, TypeError):
-                    continue
+            # Direct type-specific coercion (more efficient than retry loop)
+            coerced_value = None
+            coercion_error = None
             
-            if not success:
+            # Try the most likely type conversions first (int before bool for env vars)
+            if isinstance(value, str):
+                # String-to-type coercion (common for env vars and config files)
+                if int in types:
+                    try:
+                        coerced_value = int(value)
+                    except ValueError as e:
+                        coercion_error = e
+                        
+                if coerced_value is None and bool in types:
+                    norm = value.lower()
+                    if norm in ("true", "1", "yes", "on"):
+                        coerced_value = True
+                    elif norm in ("false", "0", "no", "off"):
+                        coerced_value = False
+                        
+                if coerced_value is None and float in types:
+                    try:
+                        coerced_value = float(value)
+                    except ValueError as e:
+                        coercion_error = e
+            
+            elif isinstance(value, (int, float)):
+                # Numeric type widening
+                if float in types and isinstance(value, int):
+                    coerced_value = float(value)
+                elif int in types and isinstance(value, float) and value.is_integer():
+                    coerced_value = int(value)
+            
+            if coerced_value is not None:
+                value = coerced_value
+            else:
                 raise ValidationError(
-                    f"Option {self.name!r} must be of type {self.expected_type!r}",
+                    f"Option {self.name!r} must be of type {self.expected_type!r}. "
+                    f"Failed to coerce {type(value).__name__} value {value!r}."
+                    + (f" Last error: {coercion_error}" if coercion_error else ""),
                     option=self.name,
                     value=value
                 )
@@ -170,6 +186,17 @@ CELERY_CORE_SCHEMA: Final[dict[str, OptionSchema]] = {
     'result_backend': OptionSchema('result_backend', str),
     'broker_connection_timeout': OptionSchema('broker_connection_timeout', (int, float), default=4.0),
     'worker_prefetch_multiplier': OptionSchema('worker_prefetch_multiplier', int, default=4, validator=validate_range(0)),
+}
+
+# Enhanced telemetry settings for production monitoring.
+CELERY_TELEMETRY_SCHEMA: Final[dict[str, OptionSchema]] = {
+    'worker_telemetry_enabled': OptionSchema('worker_telemetry_enabled', bool, default=False),
+    'worker_telemetry_collection_interval_s': OptionSchema('worker_telemetry_collection_interval_s', (int, float), default=60.0, validator=validate_range(1.0, 3600.0)),
+    'worker_telemetry_http_port': OptionSchema('worker_telemetry_http_port', int, default=9808, validator=validate_range(1024, 65535)),
+    'worker_telemetry_port_range': OptionSchema('worker_telemetry_port_range', int, default=10, validator=validate_range(1, 100)),
+    'worker_telemetry_deterministic_port': OptionSchema('worker_telemetry_deterministic_port', bool, default=False),
+    'worker_telemetry_alert_queue_depth_threshold': OptionSchema('worker_telemetry_alert_queue_depth_threshold', int, default=1000, validator=validate_range(1, 10000)),
+    'worker_telemetry_alert_latency_threshold_ms': OptionSchema('worker_telemetry_alert_latency_threshold_ms', (int, float), default=5000.0, validator=validate_range(100.0)),
 }
 
 class ConfigurationValidator:
